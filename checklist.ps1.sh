@@ -1,7 +1,7 @@
 #!/bin/bash
 : '
 :: ========================================
-:: The B.E.A.S.T (Best Executable Application for Security and Threat intelligence) Polyglot Bash/PowerShell Script (Windows first)
+:: The B.E.A.S.T (Better Executable Application for Security and Threat intelligence) Polyglot Bash/PowerShell Script (Windows first)
 :: Usage: ./checklist.ps1.sh [--normal|--forensic|--dry-run|--undo]
 :: ========================================
 '
