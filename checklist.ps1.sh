@@ -140,7 +140,7 @@ if (-not $VIRUSTOTAL_API_KEY) {
 
 # Loop through the suspicious files and check them against VirusTotal
 if ($SUSPICIOUS_FILES) {
-    foreach ($file in $SUSPICIOUS_FILES) {
+    foreach ($file in $suspiciousFiles) {
         $sha256 = Get-FileHash $file.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash
         Write-Host "[INFO] Scanning file $($file.FullName) with SHA256: $sha256"
 
