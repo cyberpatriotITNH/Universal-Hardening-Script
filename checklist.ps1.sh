@@ -10,239 +10,505 @@
 if [ -n "$PSVersionTable" ] || [ -n "$WINDIR" ]; then
 powershell -NoProfile -Command "
 param(
-    [switch]`$FORCE,
-    [switch]`$UNDO,
-    [switch]`$DRYRUN,
-    [switch]`$FORENSIC
+    [switch]$NORMAL,
+    [switch]$FORENSIC,
+    [switch]$DRYRUN,
+    [switch]$UNDO
 )
 
-function Write-Log([string]`$msg){ Write-Host \"$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `t `$msg\" }
+# Global Paths
+$TIMESTAMP = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+$BACKUP_DIR = "C:\cp-backups\$TIMESTAMP"
+$FOR_LOG = "C:\cp-logs\forensics_$TIMESTAMP.log"
+$VT_API_KEY = ""
 
-Write-Host '[WINDOWS] Starting 18-Step Hardening & Forensics'
+# Helper Function for logging
+function Write-Forensics([string]$Message){
+    Add-Content -Path $FOR_LOG -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `t $Message"
+}
 
-# --------------------------
-# Detect OS Edition
-# --------------------------
-`$WIN_EDITION = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID
-Write-Host \"[WINDOWS] Detected Edition: `$WIN_EDITION\"
-
-# --------------------------
-# Step 1: User Accounts Audit
-# --------------------------
-Write-Host '[1/18] User accounts audit...'
-`$users = Get-LocalUser
-`$admins = Get-LocalGroupMember Administrators | Select-Object -ExpandProperty Name
-foreach (`$u in `$users){
-    if (`$u.Name -eq 'Guest') {
-        if (-not `$FORENSIC) { Disable-LocalUser -Name `$u.Name; Write-Log 'Guest account disabled' } else { Write-Log 'Guest account disabled (forensic)' }
+function Backup-File([string]$Path){
+    if (Test-Path $Path){
+        $dest = Join-Path $BACKUP_DIR (Split-Path $Path -Leaf)
+        Copy-Item -Path $Path -Destination $dest -Force
+        Write-Forensics "Backed up file: $Path -> $dest"
     }
-    if (-not `$FORENSIC -and -not `$u.Enabled) { Enable-LocalUser -Name `$u.Name; Write-Log \"Enabled user `$($u.Name)\" }
 }
 
-# --------------------------
-# Step 2: Password Policies
-# --------------------------
-Write-Host '[2/18] Enforcing password policies...'
-if (-not `$FORENSIC) { net accounts /minpwlen:12 /maxpwage:90 /minpwage:10 /uniquepw:3 } else { Write-Log 'Password policy check (forensic)' }
+function VT-Scan {
+    param (
+        [string]$File
+    )
 
-# --------------------------
-# Step 3: Account Lockout
-# --------------------------
-Write-Host '[3/18] Setting account lockout policy...'
-if (-not `$FORENSIC) { net accounts /lockoutthreshold:5 /lockoutduration:30 /lockoutwindow:30 } else { Write-Log 'Account lockout policy check (forensic)' }
+    if (-not (Test-Path $File)) {
+        Write-Forensics "[ERROR] File not found: $File"
+        return
+    }
 
-# --------------------------
-# Step 4: Local Audit Policy
-# --------------------------
-Write-Host '[4/18] Enabling local audit policies...'
-if (-not `$FORENSIC) { auditpol /set /category:* /success:enable /failure:enable } else { Write-Log 'Audit policy check (forensic)' }
+    # Compute SHA256 hash
+    try {
+        $sha256 = (Get-FileHash $File -Algorithm SHA256).Hash
+    } catch {
+        Write-Forensics "[ERROR] Failed to compute hash for $File - $_"
+        return
+    }
 
-# --------------------------
-# Step 5: Security Options (MSCT)
-# --------------------------
-Write-Host '[5/18] Applying security options...'
-`$secOpts = @{
-    'DontDisplayLastUserName' = 1
-    'DisableCAD' = 0
-    'LimitBlankPasswordUse' = 1
-}
-foreach (`$key in `$secOpts.Keys){
-    if (-not `$FORENSIC) { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name `$key -Value `$secOpts[`$key]; Write-Log \"Applied `$key = `$($secOpts[`$key])\" } else { Write-Log \"Security option `$key checked (forensic)\" }
-}
+    # VirusTotal API URL and headers
+    $VTUrl = "https://www.virustotal.com/api/v3/files/$sha256"
+    $Headers = @{ "x-apikey" = $VT_API_KEY }
 
-# --------------------------
-# Step 6: Firewall
-# --------------------------
-Write-Host '[6/18] Configuring firewall...'
-if (-not `$FORENSIC) { Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow } else { Write-Log 'Firewall check (forensic)' }
-
-# --------------------------
-# Step 7: Windows Update
-# --------------------------
-Write-Host '[7/18] Enabling auto-update...'
-if (-not `$FORENSIC) {
-    `$wuSettings = New-Object -ComObject 'Microsoft.Update.AutoUpdate'
-    `$wuSettings.Settings.NotificationLevel = 4
-    `$wuSettings.Settings.Save()
-} else { Write-Log 'Windows Update check (forensic)' }
-
-# --------------------------
-# Step 8: Services (Disable Unsafe)
-# --------------------------
-Write-Host '[8/18] Disabling unsafe services...'
-`$servicesToDisable = @('FTPSVC','Spooler','RemoteRegistry','TermService')
-foreach (`$svc in `$servicesToDisable){
-    if (-not `$FORENSIC) { Stop-Service `$svc -Force; Set-Service `$svc -StartupType Disabled; Write-Log \"Stopped and disabled `$svc\" } else { Write-Log \"Service `$svc check (forensic)\" }
-}
-
-# --------------------------
-# Step 9: Windows Features
-# --------------------------
-Write-Host '[9/18] Disabling unsafe features...'
-`$featuresToDisable = @('TelnetClient','SMB1Protocol','WindowsMediaPlayer','IIS-Services','AD-Domain-Services')
-foreach (`$f in `$featuresToDisable){
-    if (-not `$FORENSIC) { Disable-WindowsOptionalFeature -Online -FeatureName `$f -NoRestart; Write-Log \"Disabled `$f\" } else { Write-Log \"Feature `$f check (forensic)\" }
-}
-
-# --------------------------
-# Step 10: Event Logs / Scheduled Tasks
-# --------------------------
-Write-Host '[10/18] Clearing event logs and scheduled tasks...'
-if (-not `$FORENSIC) { wevtutil el | Foreach-Object { wevtutil cl `$_ }; Get-ScheduledTask | Where-Object {$_.TaskName -notlike '*Microsoft*'} | Disable-ScheduledTask } else { Write-Log 'Event logs/Task check (forensic)' }
-
-# --------------------------
-# Step 11: Suspicious File Detection
-# --------------------------
-Write-Host '[11/18] Scanning for suspicious files...'
-`$suspiciousFiles = Get-ChildItem -Path 'C:\Users','C:\ProgramData' -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {($_.Attributes -match 'Hidden') -or ($_.Mode -match 'writable') -or ($_.Extension -match '.exe|.bat|.ps1')}
-`$suspiciousFiles | ForEach-Object { Write-Log \"Suspicious: `$($_.FullName)\" }
-
-# --------------------------
-# Step 12: Backup User Files
-# --------------------------
-Write-Host '[12/18] Backing up user files...'
-`$backupDir = \"C:\cp-backups\$((Get-Date -Format 'yyyy-MM-dd_HHmmss'))\"
-if (-not `$FORENSIC) { New-Item -ItemType Directory -Path `$backupDir -Force; `$suspiciousFiles | ForEach-Object { Copy-Item -Path `$_ -Destination `$backupDir -Force } } else { Write-Log 'Backup skipped in forensic mode' }
-
-# --------------------------
-# Step 13: VirusTotal scan (read-only, with API interaction)
-# --------------------------
-Write-Host '[13/18] VirusTotal scan (with API)...'
-
-# Prompt for API Key in silent mode
-$VIRUSTOTAL_API_KEY = Read-Host "Enter your VirusTotal API Key" -AsSecureString
-$VIRUSTOTAL_API_KEY = [System.Net.NetworkCredential]::new("", $VIRUSTOTAL_API_KEY).Password  # Convert SecureString to Plaintext
-
-if (-not $VIRUSTOTAL_API_KEY) {
-    Write-Host "[ERROR] No API key provided, skipping VirusTotal scan."
-    return
-}
-
-# Loop through the suspicious files and check them against VirusTotal
-if ($SUSPICIOUS_FILES) {
-    foreach ($file in $suspiciousFiles) {
-        $sha256 = Get-FileHash $file.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash
-        Write-Host "[INFO] Scanning file $($file.FullName) with SHA256: $sha256"
-
-        # Prepare the VirusTotal API URL
-        $vtApiUrl = "https://www.virustotal.com/api/v3/files/$sha256"
-        $headers = @{
-            "x-apikey" = $VIRUSTOTAL_API_KEY
-        }
-
+    $success = $false
+    while (-not $success) {
         try {
-            # Make API Request to VirusTotal
-            $response = Invoke-RestMethod -Uri $vtApiUrl -Headers $headers -Method Get
+            $Response = Invoke-RestMethod -Uri $VTUrl -Headers $Headers -Method GET
 
-            # Output results
-            if ($response.data) {
-                $scanResults = $response.data.attributes.last_analysis_stats
-                Write-Host "[VT Scan Result] $($file.FullName):"
-                Write-Host "[INFO] Scan results: $($scanResults)"
+            if ($Response.data) {
+                $Stats = $Response.data.attributes.last_analysis_stats
+
+                if ($Stats.malicious -gt 0) {
+                    Write-Forensics "[MALICIOUS] $File detected as malicious by VirusTotal"
+                } else {
+                    Write-Forensics "[CLEAN] $File scanned clean by VirusTotal"
+                }
+
             } else {
-                Write-Host "[INFO] No scan results available for $($file.FullName)"
+                Write-Forensics "[INFO] No VirusTotal data available for $File"
+            }
+
+            $success = $true
+        } catch {
+            # Handle 429 "Too Many Requests"
+            if ($_ -match "429") {
+                Write-Forensics "[VT WAIT] Too Many Requests for $File, waiting 60 seconds..."
+                Start-Sleep -Seconds 60
+            } else {
+                Write-Forensics "[ERROR] VirusTotal scan failed for $File - $_"
+                $success = $true
             }
         }
-        catch {
-            Write-Host "[ERROR] Failed to get scan results for $($file.FullName). Error: $_"
+    }
+
+    # Wait 15 seconds between files to respect 4 requests/min
+    Start-Sleep -Seconds 15
+}
+
+# -----------------------------
+# Step 0: Prepare directories
+# -----------------------------
+if (-not $DRYRUN){
+    New-Item -ItemType Directory -Path $BACKUP_DIR -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path $FOR_LOG) -Force | Out-Null
+}
+
+Write-Host "[INFO] Starting 18-step hardening & forensics..."
+Write-Forensics "[INFO] Script started in mode: $($NORMAL ? 'NORMAL' : 'FORENSIC')"
+
+# --------------------------
+# STEP 1-2: USER/ADMIN AUDIT & STRONG PASSWORD ENFORCEMENT
+# Interactive Notepad input for authorized accounts, passwords optional
+# --------------------------
+Write-Host "[1/18] Interactive user/admin audit"
+
+# Temporary file for authorized users/admins
+$tmpFile = "$env:TEMP\authorized_users.txt"
+@"
+# Paste your authorized users/admins below
+# Format:
+# Authorized Administrators:
+# benjamin (you)
+# password: W1llH4ck4B4con
+# llitt
+# Password: ugotlittup
+# Authorized Users:
+# user1
+# user2
+"@ | Out-File -FilePath $tmpFile -Encoding UTF8
+
+# Open Notepad and wait for user input
+Start-Process notepad.exe $tmpFile -Wait
+
+# Read and parse input
+$allLines = Get-Content $tmpFile
+$section = ""
+$admins_list = @()
+$users_list = @()
+$admin_passwords = @{}
+$lastAdmin = ""
+
+foreach ($line in $allLines) {
+    $line = $line.Trim()
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    if ($line -like "#*") { continue }
+
+    switch ($line) {
+        "Authorized Administrators:" { $section = "admin"; continue }
+        "Authorized Users:" { $section = "user"; continue }
+    }
+
+    if ($section -eq "admin") {
+        if ($line -match "^password:\s*(.+)$") {
+            $admin_passwords[$lastAdmin] = $Matches[1]
+        } else {
+            $lastAdmin = $line
+            $admins_list += $line
+        }
+    } elseif ($section -eq "user") {
+        $users_list += $line
+    }
+}
+
+$allAuthorized = $admins_list + $users_list
+$foundUsers = Get-LocalUser
+$removedUsers = @()
+
+foreach ($u in $foundUsers) {
+    if (-not ($allAuthorized -contains $u.Name)) {
+        Write-Host "[ALERT] Unauthorized user found: $($u.Name)"
+        Add-Content $FORENSICS_LOG "[USER AUDIT] Unauthorized user detected: $($u.Name)"
+
+        if (-not $FORENSIC -and -not $DRYRUN) {
+            $choice = Read-Host "Do you want to remove $($u.Name)? [y/N]"
+            if ($choice -match "^[Yy]$") {
+                Remove-LocalUser -Name $u.Name
+                Add-Content $FORENSICS_LOG "User $($u.Name) removed."
+            }
+        }
+    } else {
+        Add-Content $FORENSICS_LOG "[USER AUDIT] Authorized user verified: $($u.Name)"
+    }
+}
+Write-Host "[2/18] Admin password enforcement..."
+
+# --------------------------
+# Enforce strong passwords for administrators
+# --------------------------
+foreach ($admin in $admins_list) {
+    $localUser = Get-LocalUser -Name $admin -ErrorAction SilentlyContinue
+    if ($null -ne $localUser) {
+        # If password not set or weak, enforce a strong password
+        $passwordSet = $false
+        try {
+            $hash = (Get-LocalUser $admin).PasswordExpires
+            $passwordSet = $true
+        } catch {}
+        
+        if (-not $passwordSet -or $admin_passwords[$admin]) {
+            if (-not $FORENSIC -and -not $DRYRUN) {
+                # Prompt for strong password
+                $securePass = Read-Host "Enter strong password for admin $admin" -AsSecureString
+                if ($securePass.Length -lt 12) {
+                    Write-Host "[WARN] Password too short; recommend 12+ characters"
+                }
+                $plainPass = [System.Net.NetworkCredential]::new("", $securePass).Password
+                $admin_passwords[$admin] = $plainPass
+                # Apply password
+                $localUser | Set-LocalUser -Password $securePass
+                Add-Content $FORENSICS_LOG "[PASSWORD] Password set/updated for admin: $admin"
+            } else {
+                Add-Content $FORENSICS_LOG "[PASSWORD] Admin $admin requires password set/update (forensic/dry-run)"
+            }
+        } else {
+            Add-Content $FORENSICS_LOG "[PASSWORD] Admin $admin password verified"
         }
     }
-} else {
-    Write-Host '[INFO] No suspicious files found, skipping VirusTotal scan.'
 }
 
 # --------------------------
-# Step 14: Extra MSCT Security Baseline
+# Disable Guest account
 # --------------------------
-Write-Host '[14/18] Extra MSCT hardening (Windows-only)'
-if ($EXTRA -and -not $FORENSIC) {
-    # Network hardening
-    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' `
-        -Name 'RequireSecuritySignature' -Value 1
-    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' `
-        -Name 'EnableSecuritySignature' -Value 1
-
-    # Restrict removable drives
-    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\StorageDevicePolicies' `
-        -Name 'WriteProtect' -PropertyType DWord -Value 1 -Force | Out-Null
-
-    Write-Host '[INFO] Extra MSCT settings applied'
-} else {
-    Write-Host '[INFO] Extra mode not enabled or forensic mode active, skipping'
-}
-
-# --------------------------
-# Step 15: Password Expiry and Enforcement Review
-# --------------------------
-Write-Host '[15/18] Reviewing password expiry and enforcement...'
-$allUsers = Get-LocalUser
-foreach ($u in $allUsers) {
-    $pwdInfo = net user $u.Name
-    if ($pwdInfo -match 'Password expires') {
-        Write-Host "User $($u.Name) password info: $($pwdInfo | Select-String 'Password expires')"
+$guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+if ($guest) {
+    if (-not $FORENSIC -and -not $DRYRUN) {
+        Disable-LocalUser -Name "Guest"
+        Add-Content $FORENSICS_LOG "[USER AUDIT] Guest account disabled"
     } else {
-        Write-Host "User $($u.Name) has no expiration set"
+        Add-Content $FORENSICS_LOG "[USER AUDIT] Guest account found (forensic/dry-run)"
     }
 }
 
-# --------------------------
-# Step 16: Audit Policy Review
-# --------------------------
-Write-Host '[16/18] Reviewing local audit policies...'
-$auditSettings = auditpol /get /category:*
-foreach ($line in $auditSettings) {
-    Write-Host $line
-}
+# -----------------------------
+# Step 3: Account Lockout
+# -----------------------------
+Write-Host "[3/18] Account Lockout Policy..."
+if ($NORMAL -and -not $DRYRUN){ net accounts /lockoutthreshold:5 /lockoutduration:30 /lockoutwindow:30 }
+Write-Forensics "Checked/enforced account lockout policy"
 
-# --------------------------
-# Step 17: Security Options Validation
-# --------------------------
-Write-Host '[17/18] Validating key security options...'
-$securityKeys = @{
+# -----------------------------
+# Step 4: Local Audit Policy
+# -----------------------------
+Write-Host "[4/18] Local Audit Policy..."
+if ($NORMAL -and -not $DRYRUN){ auditpol /set /category:* /success:enable /failure:enable }
+Write-Forensics "Audit policy enabled for all categories"
+
+# -----------------------------
+# Step 5: Security Options
+# -----------------------------
+Write-Host "[5/18] Security Options..."
+$SecOpts = @{
     'DontDisplayLastUserName' = 1
     'DisableCAD' = 0
     'LimitBlankPasswordUse' = 1
 }
+foreach ($key in $SecOpts.Keys){
+    if ($NORMAL -and -not $DRYRUN){
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name $key -Value $SecOpts[$key]
+    }
+    Write-Forensics "Security option $key checked/applied"
+}
 
-foreach ($key in $securityKeys.Keys) {
-    $currentValue = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name $key).$key
-    if ($currentValue -eq $securityKeys[$key]) {
-        Write-Host "[OK] $key is correctly configured ($currentValue)"
-    } else {
-        Write-Host "[WARN] $key is $currentValue, expected $($securityKeys[$key])"
+# -----------------------------
+# Step 6: Firewall
+# -----------------------------
+Write-Host "[6/18] Firewall Configuration..."
+if ($NORMAL -and -not $DRYRUN){
+    Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow
+}
+Write-Forensics "Firewall configured"
+
+# -----------------------------
+# Step 7: Windows Update
+# -----------------------------
+Write-Host "[7/18] Windows Update..."
+if ($NORMAL -and -not $DRYRUN){
+    $wuSettings = New-Object -ComObject 'Microsoft.Update.AutoUpdate'
+    $wuSettings.Settings.NotificationLevel = 4
+    $wuSettings.Settings.Save()
+}
+Write-Forensics "Windows Update configured"
+
+# -----------------------------
+# Step 8: Services (Disable Unsafe)
+# -----------------------------
+Write-Host "[8/18] Disabling Unsafe Services..."
+$ServicesToDisable = @('FTPSVC','Spooler','RemoteRegistry','TermService')
+foreach ($svc in $ServicesToDisable){
+    if ($NORMAL -and -not $DRYRUN){
+        Stop-Service $svc -Force
+        Set-Service $svc -StartupType Disabled
+    }
+    Write-Forensics "Service $svc checked/disabled"
+}
+
+# -----------------------------
+# Step 9: Windows Features
+# -----------------------------
+Write-Host "[9/18] Disabling Unsafe Features..."
+$FeaturesToDisable = @('TelnetClient','SMB1Protocol','WindowsMediaPlayer','IIS-Services','AD-Domain-Services')
+foreach ($f in $FeaturesToDisable){
+    if ($NORMAL -and -not $DRYRUN){
+        Disable-WindowsOptionalFeature -Online -FeatureName $f -NoRestart
+    }
+    Write-Forensics "Feature $f checked/disabled"
+}
+
+# -----------------------------
+# Step 10: Event Logs / Scheduled Tasks
+# -----------------------------
+Write-Host "[10/18] Event Logs & Scheduled Tasks..."
+if ($NORMAL -and -not $DRYRUN){
+    wevtutil el | ForEach-Object { wevtutil cl $_ }
+    Get-ScheduledTask | Where-Object {$_.TaskName -notlike '*Microsoft*'} | Disable-ScheduledTask
+}
+Write-Forensics "Event logs cleared; non-Microsoft scheduled tasks disabled"
+
+# -----------------------------
+# Step 11: Suspicious File Detection
+# -----------------------------
+Write-Host "[11/18] Suspicious File Scan..."
+
+# Collect suspicious files in C:\Users and C:\ProgramData
+$SuspiciousFiles = Get-ChildItem -Path 'C:\Users','C:\ProgramData' -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { 
+        # Script executables or hidden files
+        $_.Extension -match '.ps1|.bat|.exe|.pl|.py' -or $_.Attributes -match 'Hidden' 
+    }
+
+foreach ($f in $SuspiciousFiles) {
+    $reason = @()
+
+    # Check for hidden attribute
+    if ($f.Attributes -match 'Hidden') {
+        $reason += "Hidden file"
+    }
+
+    # Check for suspicious extension
+    if ($f.Extension -match '.ps1|.bat|.exe|.pl|.py') {
+        $reason += "Suspicious extension ($($f.Extension))"
+    }
+
+    # Check shebang mismatch for scripts (powershell, python, perl, bash)
+    if ($f.Extension -match '.ps1|.pl|.py|.bat') {
+        try {
+            $FirstLine = Get-Content $f.FullName -ErrorAction SilentlyContinue -TotalCount 1
+            if ($FirstLine -match '^#!' -and -not $FirstLine -match 'powershell|python|perl|bash') {
+                $reason += "Shebang mismatch"
+            }
+        } catch {
+            Write-Forensics "[ERROR] Failed to read $($f.FullName) - $_"
+        }
+    }
+
+    if ($reason.Count -gt 0) {
+        $reasonStr = ($reason -join '; ')
+        Write-Forensics "[SUSPICIOUS] $($f.FullName) - Reason: $reasonStr"
     }
 }
 
-# --------------------------
-# Step 18: Apache / MySQL Detection
-# --------------------------
-Write-Host '[18/18] Detecting Apache / MySQL services...'
-if (Get-Service | Where-Object {$_.Name -match 'Apache|MySQL'}) {
-    Write-Log 'Apache/MySQL detected — applying service-specific hardening'
+# -----------------------------
+# Step 12: Backup User Files
+# -----------------------------
+Write-Host "[12/18] Backing up all user files..."
+if ($NORMAL -and -not $DRYRUN){
+    Get-ChildItem -Path C:\Users -Recurse -Force | ForEach-Object { Backup-File $_.FullName }
 }
 
-Write-Host '[WINDOWS] Full 18-step report complete'
-exit
+# -----------------------------
+# Step 13: VirusTotal Scan
+# -----------------------------
+Write-Host "[13/18] VirusTotal Scan..."
+if (-not $DRYRUN){
+    if (-not $VT_API_KEY){
+        $VT_API_KEY = Read-Host "Enter your VirusTotal API key"
+    }
+    foreach ($f in $SuspiciousFiles){
+        VT-Scan $f.FullName
+    }
+}
+
+# -----------------------------
+# Step 14: Extra MSCT Hardening
+# -----------------------------
+Write-Host "[14/18] Extra MSCT Hardening..."
+if ($NORMAL -and -not $DRYRUN){
+    # Example network & removable drive restrictions
+    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' -Name 'RequireSecuritySignature' -Value 1
+    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'EnableSecuritySignature' -Value 1
+    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\StorageDevicePolicies' -Name 'WriteProtect' -PropertyType DWord -Value 1 -Force | Out-Null
+}
+Write-Forensics "Extra MSCT hardening applied"
+
+# -----------------------------
+# Step 15: Password Expiry & Enforcement Review
+# -----------------------------
+Write-Host "[15/18] Password Expiry & Enforcement..."
+$AllUsers = Get-LocalUser
+foreach ($u in $AllUsers){
+    $PwdInfo = net user $u.Name
+    Write-Forensics "Password info for $($u.Name): $($PwdInfo | Select-String 'Password expires')"
+}
+
+# -----------------------------
+# Step 16: Audit Policy Review
+# -----------------------------
+Write-Host "[16/18] Audit Policy Review..."
+$auditSettings = auditpol /get /category:*
+foreach ($line in $auditSettings){ Write-Forensics "[AUDIT] $line" }
+
+# -----------------------------
+# Step 17: Security Options Validation
+# -----------------------------
+Write-Host "[17/18] Security Options Validation..."
+foreach ($key in $SecOpts.Keys){
+    $current = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name $key).$key
+    Write-Forensics "Security key $key: current=$current, expected=$($SecOpts[$key])"
+}
+
+# -----------------------------
+# Step 18: Apache/MySQL Detection & Hardening
+# -----------------------------
+Write-Host '[18/18] Apache/MySQL Detection & Hardening'
+
+function Log-Forensics($message) {
+    $forensicsLog = "C:\cp-logs\forensics_$((Get-Date -Format 'yyyy-MM-dd_HHmmss')).log"
+    Add-Content -Path $forensicsLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `t $message"
+}
+
+# Function to get a strong password from user
+function Get-StrongPassword {
+    do {
+        $pass1 = Read-Host "Enter strong MySQL root password (min 12 chars)" -AsSecureString
+        $pass2 = Read-Host "Confirm password" -AsSecureString
+        $plain1 = [System.Net.NetworkCredential]::new("", $pass1).Password
+        $plain2 = [System.Net.NetworkCredential]::new("", $pass2).Password
+        if ($plain1.Length -ge 12 -and $plain1 -eq $plain2) {
+            return $plain1
+        } else {
+            Write-Host "[WARN] Passwords do not match or are too short. Try again."
+        }
+    } while ($true)
+}
+
+# -----------------------------
+# Apache Hardening
+# -----------------------------
+$apacheSvc = Get-Service | Where-Object {$_.Name -match "Apache"} 
+if ($apacheSvc) {
+    Log-Forensics "Detected Apache service"
+    Write-Host "[INFO] Applying Apache hardening..."
+    if (-not $DRYRUN) {
+        # Enable recommended modules if using Apache for Windows (depends on package)
+        # Disable directory listing via httpd.conf or conf.d/security.conf
+        $httpdConf = "C:\Apache24\conf\httpd.conf"
+        if (Test-Path $httpdConf) {
+            # Backup first
+            Copy-Item $httpdConf "$httpdConf.bak" -Force
+            # Disable directory listing
+            (Get-Content $httpdConf) -replace 'Options Indexes', 'Options -Indexes' | Set-Content $httpdConf
+            # Harden ServerTokens and ServerSignature
+            (Get-Content $httpdConf) -replace 'ServerTokens OS', 'ServerTokens Prod' | Set-Content $httpdConf
+            (Get-Content $httpdConf) -replace 'ServerSignature On', 'ServerSignature Off' | Set-Content $httpdConf
+            Start-Service $apacheSvc.Name -ErrorAction SilentlyContinue
+            Log-Forensics "Apache hardened: Indexes disabled, ServerTokens/Signature secured, config backed up"
+        } else {
+            Log-Forensics "Apache httpd.conf not found at $httpdConf"
+        }
+    } else {
+        Log-Forensics "[DRY-RUN] Apache hardening would be applied"
+    }
+}
+
+# -----------------------------
+# MySQL Hardening
+# -----------------------------
+$mysqlSvc = Get-Service | Where-Object {$_.Name -match "MySQL|mysqld"}
+if ($mysqlSvc) {
+    Log-Forensics "Detected MySQL service"
+    Write-Host "[INFO] Applying MySQL best-practice hardening..."
+    if (-not $DRYRUN) {
+        $mysqlRootPass = Get-StrongPassword
+        # Secure root password, remove anonymous users, drop test DB, flush privileges
+        $sqlCmds = @"
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$mysqlRootPass';
+DELETE FROM mysql.user WHERE User='';
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db LIKE 'test\_%';
+FLUSH PRIVILEGES;
+"@
+        # Save SQL commands to temp file
+        $tmpSql = "$env:TEMP\mysql_hardening.sql"
+        $sqlCmds | Set-Content $tmpSql
+        # Execute SQL commands using mysql client
+        & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p"$mysqlRootPass" < $tmpSql
+        Remove-Item $tmpSql -Force
+        Log-Forensics "MySQL hardened: root password set, anonymous users removed, test DB removed, privileges flushed"
+        # Optional: enforce SSL if configured
+        & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p"$mysqlRootPass" -e "ALTER USER 'root'@'localhost' REQUIRE SSL;"
+        Log-Forensics "MySQL SSL enforcement applied for root"
+    } else {
+        Log-Forensics "[DRY-RUN] MySQL hardening would be applied"
+    }
+}
+
+Write-Host "[INFO] 18-step hardening & forensics complete"
+Write-Forensics "[INFO] Script completed"
+# --------------------------
+# LOG PATHS TO STDOUT
+# --------------------------
+Write-Host "================== LOG LOCATIONS =================="
+if (Test-Path $LOG)          { Write-Host "Normal log:        $LOG" }
+if (Test-Path $ERR)          { Write-Host "Error log:         $ERR" }
+if (Test-Path $FORENSICS_LOG){ Write-Host "Forensics log:     $FORENSICS_LOG" }
+Write-Host "==================================================="
 "
 fi
 
@@ -469,12 +735,35 @@ $DRYRUN || sudo systemctl mask rpcbind.service
 # Step 14: SUSPICIOUS FILE SCAN
 ##########################
 echo "--- [14/18] Suspicious files scan ---"
-echo "" > "$SUSPICIOUS_OUTPUT"
-find /etc /usr /bin /sbin -type f -perm -0002 >> "$SUSPICIOUS_OUTPUT" 2>/dev/null
-find /usr/bin /usr/sbin -type f \( -perm -4000 -o -perm -2000 \) >> "$SUSPICIOUS_OUTPUT" 2>/dev/null
-find /etc /home -name ".*" -type f >> "$SUSPICIOUS_OUTPUT" 2>/dev/null
-find /tmp /var/tmp -type f \( -name "*.sh" -o -name "*.py" -o -name "*.pl" -o -name "*.php" -o -name "*.exe" \) >> "$SUSPICIOUS_OUTPUT" 2>/dev/null
+> "$SUSPICIOUS_OUTPUT"
 
+# Function to log suspicious files with reason
+log_suspicious() {
+    local file="$1"
+    local reason="$2"
+    echo "[SUSPICIOUS] $file - Reason: $reason" | tee -a "$FORENSICS_LOG"
+    echo "$file" >> "$SUSPICIOUS_OUTPUT"
+}
+
+# World-writable files
+while IFS= read -r f; do
+    log_suspicious "$f" "World-writable"
+done < <(find /etc /usr /bin /sbin -type f -perm -0002 2>/dev/null)
+
+# SUID/SGID files
+while IFS= read -r f; do
+    log_suspicious "$f" "SUID/SGID"
+done < <(find /usr/bin /usr/sbin -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)
+
+# Hidden files in /etc and /home
+while IFS= read -r f; do
+    log_suspicious "$f" "Hidden file"
+done < <(find /etc /home -name ".*" -type f 2>/dev/null)
+
+# Scripts or executables in /tmp and /var/tmp
+while IFS= read -r f; do
+    log_suspicious "$f" "Suspicious extension ($(basename "$f"))"
+done < <(find /tmp /var/tmp -type f \( -name "*.sh" -o -name "*.py" -o -name "*.pl" -o -name "*.php" -o -name "*.exe" \) 2>/dev/null)
 ##########################
 # Step 15: BACKUP SUSPICIOUS FILES
 ##########################
@@ -506,12 +795,59 @@ $DRYRUN || {
 ##########################
 # Step 18: VIRUSTOTAL SCAN
 ##########################
-echo "--- [18/18] VirusTotal hash scan ---"
-read -sp "Enter VirusTotal API key (optional): " VIRUSTOTAL_API_KEY; echo
-if [[ -n "$VIRUSTOTAL_API_KEY" && "$MODE" == "forensic" ]]; then
-    while read -r f; do
-        sha256sum "$f" | awk '{print $1}' | xargs -I {} echo "VT hash: {}"
-    done < "$SUSPICIOUS_OUTPUT"
+# --------------------------
+# Step 18: VirusTotal Scan (Linux, smart sleep)
+# --------------------------
+
+if [[ "$DRYRUN" == false ]]; then
+    echo "--- [18/18] Running VirusTotal scan on suspicious files ---" | tee -a "$FORENSICS_LOG"
+
+    read -sp "Enter VirusTotal API Key: " VIRUSTOTAL_API_KEY
+    echo
+    if [[ -z "$VIRUSTOTAL_API_KEY" ]]; then
+        echo "[ERROR] No API key provided, skipping VirusTotal scan." | tee -a "$FORENSICS_LOG"
+    else
+        while IFS= read -r line; do
+            file=$(echo "$line" | cut -d'|' -f1)
+            reason=$(echo "$line" | cut -d'|' -f2)
+            file=$(echo "$file" | sed 's|\\|/|g')
+            sha256=$(sha256sum "$file" | awk '{print $1}')
+            echo "[VT] Suspicious file: $file | Reason: $reason | SHA256: $sha256" | tee -a "$FORENSICS_LOG"
+
+            success=false
+            while [[ "$success" == false ]]; do
+                response=$(curl -sSL -w "%{http_code}" -H "x-apikey: $VIRUSTOTAL_API_KEY" \
+                    "https://www.virustotal.com/api/v3/files/$sha256")
+                http_code="${response: -3}"  # Last 3 chars are the HTTP status
+                body="${response::-3}"       # Rest is the JSON body
+
+                if [[ "$http_code" == "200" ]]; then
+                    malicious=$(echo "$body" | jq '.data.attributes.last_analysis_stats.malicious')
+                    suspicious=$(echo "$body" | jq '.data.attributes.last_analysis_stats.suspicious')
+                    harmless=$(echo "$body" | jq '.data.attributes.last_analysis_stats.harmless')
+                    echo "[VT RESULT] $file | Malicious: $malicious | Suspicious: $suspicious | Harmless: $harmless" | tee -a "$FORENSICS_LOG"
+                    success=true
+                elif [[ "$http_code" == "429" ]]; then
+                    echo "[VT WAIT] Too Many Requests for $file, waiting 60 seconds..." | tee -a "$FORENSICS_LOG"
+                    sleep 60
+                else
+                    echo "[VT ERROR] $file | HTTP $http_code | Response: $body" | tee -a "$FORENSICS_LOG"
+                    success=true
+                fi
+            done
+
+            # Always wait 15 seconds after each request
+            sleep 15
+        done < "$SUSPICIOUS_OUTPUT"
+    fi
 fi
 
 echo -e "${GREEN}BASH 18-STEP HARDENING COMPLETE${RESET}"
+# --------------------------
+# LOG PATHS TO STDOUT
+# --------------------------
+echo "================== LOG LOCATIONS =================="
+[[ -f "$LOG" ]] && echo "Normal log:        $LOG"
+[[ -f "$ERR" ]] && echo "Error log:         $ERR"
+[[ -f "$FORENSICS_LOG" ]] && echo "Forensics log:     $FORENSICS_LOG"
+echo "==================================================="
