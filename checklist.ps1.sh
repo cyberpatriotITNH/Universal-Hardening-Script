@@ -6,15 +6,26 @@
 :: ========================================
 '
 
-# Detect PowerShell environment
-if [ -n "$PSVersionTable" ] || [ -n "$WINDIR" ]; then
-powershell -NoProfile -Command "
+# Detect PowerShell environment (Windows via WINDIR in bash/WSL)
+if [ -n "$WINDIR" ]; then
+    # Write PS code to a temp file so param() works and bash does NOT expand PS variables
+    _TEMP_PS=$(mktemp "${TEMP:-/tmp}/XXXXXXXXXX.ps1")
+    # Map bash CLI args to PowerShell switches
+    _PS_ARGS=""
+    for _arg in "$@"; do
+        case "$_arg" in
+            --normal)            _PS_ARGS="$_PS_ARGS -NORMAL" ;;
+            --forensic|--forensics) _PS_ARGS="$_PS_ARGS -FORENSIC" ;;
+            --dry-run)           _PS_ARGS="$_PS_ARGS -DRYRUN" ;;
+            --undo)              _PS_ARGS="$_PS_ARGS -UNDO" ;;
+        esac
+    done
+    cat > "$_TEMP_PS" << 'END_PS'
 # ========================================
 # CyberPatriot PowerShell Hardening Script
 # All findings go to Forensics log
 # System changes go to Normal log
 # ========================================
-
 param(
     [switch]$NORMAL,
     [switch]$FORENSIC,
@@ -357,7 +368,11 @@ FLUSH PRIVILEGES;
 
 Write-Host "[INFO] 18-step hardening & forensics complete"
 Write-Forensics "[INFO] Script completed"
-"
+END_PS
+    powershell -NoProfile -ExecutionPolicy Bypass -File "$_TEMP_PS" $_PS_ARGS
+    _EXIT=$?
+    rm -f "$_TEMP_PS"
+    exit $_EXIT
 fi
 
 
@@ -514,8 +529,14 @@ echo "--- [4/18] PAM/SSH hardening ---"
 backup_file "$PAM_DIR/common-password"
 backup_file "$SSHD"
 $DRYRUN || {
-    sudo sed -i 's/^#\(.*pam_cracklib.so.*\)/\1 minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1/' "$PAM_DIR/common-password"
-    sudo sed -i 's/^#\(PermitRootLogin\s*\).*$/\1 no/' "$SSHD"
+    if grep -q "pam_pwquality.so" "$PAM_DIR/common-password"; then
+        sudo sed -i '/pam_pwquality.so/{ /minlen/! s/$/ minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1/ }' "$PAM_DIR/common-password"
+    elif grep -q "pam_cracklib.so" "$PAM_DIR/common-password"; then
+        sudo sed -i 's/pam_cracklib.so.*/pam_cracklib.so minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1/' "$PAM_DIR/common-password"
+    else
+        echo "[WARN] No pam_pwquality or pam_cracklib found; skipping password complexity config"
+    fi
+    sudo sed -i 's/^#*\s*PermitRootLogin\s.*/PermitRootLogin no/' "$SSHD"
 }
 
 ##########################
@@ -551,7 +572,20 @@ $DRYRUN || sudo chage --maxdays 90 --mindays 10 $USER
 # Step 9: ACCOUNT LOCKOUT
 ##########################
 echo "--- [9/18] Account lockout ---"
-$DRYRUN || sudo faillock --user $USER --reset
+$DRYRUN || FAILLOCK_CONF="/etc/security/faillock.conf"
+if [[ -f "$FAILLOCK_CONF" ]]; then
+    sudo grep -q "^deny" "$FAILLOCK_CONF" \
+        && sudo sed -i 's/^deny\s*=.*/deny = 5/' "$FAILLOCK_CONF" \
+        || echo "deny = 5" | sudo tee -a "$FAILLOCK_CONF" > /dev/null
+    sudo grep -q "^unlock_time" "$FAILLOCK_CONF" \
+        && sudo sed -i 's/^unlock_time\s*=.*/unlock_time = 1800/' "$FAILLOCK_CONF" \
+        || echo "unlock_time = 1800" | sudo tee -a "$FAILLOCK_CONF" > /dev/null
+    echo "[LOCKOUT] Set deny=5, unlock_time=1800 in faillock.conf"
+else
+    echo "[WARN] faillock.conf not found; attempting PAM tally2 fallback"
+    sudo sed -i '/pam_tally2/ { /deny/! s/$/ deny=5 unlock_time=1800/ }' "$PAM_DIR/common-auth" 2>/dev/null || \
+        echo "[WARN] Could not configure account lockout automatically"
+fi
 
 ##########################
 # Step 10: LOCAL AUDIT POLICY
@@ -622,6 +656,8 @@ $DRYRUN || while read -r f; do backup_file "$f"; done < "$SUSPICIOUS_OUTPUT"
 # Step 16: READ README / Apache/MySQL Detection
 ##########################
 echo "--- [16/18] Detecting Apache/MySQL & scanning README ---"
+APACHE_FOUND=false
+MYSQL_FOUND=false
 README_PATH=$(find / -type f -iname 'README' 2>/dev/null | head -n1)
 if [[ -z "$README_PATH" ]]; then
     read -p "README not found. Enter README URL: " README_URL
@@ -636,8 +672,8 @@ if grep -iq "mysql" "$README_PATH"; then echo "[INFO] MySQL mentioned in README"
 ##########################
 echo "--- [17/18] Apache/MySQL hardening ---"
 $DRYRUN || {
-    $APACHE_FOUND && sudo a2enmod security2 headers; sudo systemctl restart apache2
-    $MYSQL_FOUND && sudo mysql_secure_installation
+    [[ "${APACHE_FOUND:-false}" == true ]] && { sudo a2enmod security2 headers; sudo systemctl restart apache2; }
+    [[ "${MYSQL_FOUND:-false}" == true ]] && sudo mysql_secure_installation
 }
 
 ##########################
