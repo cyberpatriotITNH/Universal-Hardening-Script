@@ -572,19 +572,21 @@ $DRYRUN || sudo chage --maxdays 90 --mindays 10 $USER
 # Step 9: ACCOUNT LOCKOUT
 ##########################
 echo "--- [9/18] Account lockout ---"
-$DRYRUN || FAILLOCK_CONF="/etc/security/faillock.conf"
-if [[ -f "$FAILLOCK_CONF" ]]; then
-    sudo grep -q "^deny" "$FAILLOCK_CONF" \
-        && sudo sed -i 's/^deny\s*=.*/deny = 5/' "$FAILLOCK_CONF" \
-        || echo "deny = 5" | sudo tee -a "$FAILLOCK_CONF" > /dev/null
-    sudo grep -q "^unlock_time" "$FAILLOCK_CONF" \
-        && sudo sed -i 's/^unlock_time\s*=.*/unlock_time = 1800/' "$FAILLOCK_CONF" \
-        || echo "unlock_time = 1800" | sudo tee -a "$FAILLOCK_CONF" > /dev/null
-    echo "[LOCKOUT] Set deny=5, unlock_time=1800 in faillock.conf"
-else
-    echo "[WARN] faillock.conf not found; attempting PAM tally2 fallback"
-    sudo sed -i '/pam_tally2/ { /deny/! s/$/ deny=5 unlock_time=1800/ }' "$PAM_DIR/common-auth" 2>/dev/null || \
-        echo "[WARN] Could not configure account lockout automatically"
+FAILLOCK_CONF="/etc/security/faillock.conf"
+if [[ "$DRYRUN" == false ]]; then
+    if [[ -f "$FAILLOCK_CONF" ]]; then
+        sudo grep -q "^deny" "$FAILLOCK_CONF" \
+            && sudo sed -i 's/^deny\s*=.*/deny = 5/' "$FAILLOCK_CONF" \
+            || echo "deny = 5" | sudo tee -a "$FAILLOCK_CONF" > /dev/null
+        sudo grep -q "^unlock_time" "$FAILLOCK_CONF" \
+            && sudo sed -i 's/^unlock_time\s*=.*/unlock_time = 1800/' "$FAILLOCK_CONF" \
+            || echo "unlock_time = 1800" | sudo tee -a "$FAILLOCK_CONF" > /dev/null
+        echo "[LOCKOUT] Set deny=5, unlock_time=1800 in faillock.conf"
+    else
+        echo "[WARN] faillock.conf not found; attempting PAM tally2 fallback"
+        sudo sed -i '/pam_tally2/ { /deny/! s/$/ deny=5 unlock_time=1800/ }' "$PAM_DIR/common-auth" 2>/dev/null || \
+            echo "[WARN] Could not configure account lockout automatically"
+    fi
 fi
 
 ##########################
