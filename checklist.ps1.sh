@@ -953,7 +953,9 @@ $DRYRUN || {
         fi
         echo "[SSH] Set $key = $val"
     done
-    sudo systemctl reload sshd 2>>"$ERR" && echo "[SSH] sshd reloaded" || echo "[WARN] sshd reload failed"
+    SSH_SVC=ssh
+systemctl list-units --type=service 2>/dev/null | grep -q "sshd.service" && SSH_SVC=sshd
+sudo systemctl reload $SSH_SVC 2>>"$ERR" && echo "[SSH] $SSH_SVC reloaded" || echo "[WARN] $SSH_SVC reload failed"
     echo "[SSH] Full SSH hardening applied" | tee -a "$FORENSICS_LOG"
 }
 $DRYRUN && echo "[DRY-RUN] Would apply full SSH hardening"
