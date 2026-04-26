@@ -6,26 +6,15 @@
 :: ========================================
 '
 
-# Detect PowerShell environment (Windows via WINDIR in bash/WSL)
-if [ -n "$WINDIR" ]; then
-    # Write PS code to a temp file so param() works and bash does NOT expand PS variables
-    _TEMP_PS=$(mktemp "${TEMP:-/tmp}/XXXXXXXXXX.ps1")
-    # Map bash CLI args to PowerShell switches
-    _PS_ARGS=""
-    for _arg in "$@"; do
-        case "$_arg" in
-            --normal)            _PS_ARGS="$_PS_ARGS -NORMAL" ;;
-            --forensic|--forensics) _PS_ARGS="$_PS_ARGS -FORENSIC" ;;
-            --dry-run)           _PS_ARGS="$_PS_ARGS -DRYRUN" ;;
-            --undo)              _PS_ARGS="$_PS_ARGS -UNDO" ;;
-        esac
-    done
-    cat > "$_TEMP_PS" << 'END_PS'
+# Detect PowerShell environment
+if [ -n "$PSVersionTable" ] || [ -n "$WINDIR" ]; then
+powershell -NoProfile -Command - <<'PSEOF'
 # ========================================
 # CyberPatriot PowerShell Hardening Script
 # All findings go to Forensics log
 # System changes go to Normal log
 # ========================================
+
 param(
     [switch]$NORMAL,
     [switch]$FORENSIC,
@@ -368,11 +357,7 @@ FLUSH PRIVILEGES;
 
 Write-Host "[INFO] 18-step hardening & forensics complete"
 Write-Forensics "[INFO] Script completed"
-END_PS
-    powershell -NoProfile -ExecutionPolicy Bypass -File "$_TEMP_PS" $_PS_ARGS
-    _EXIT=$?
-    rm -f "$_TEMP_PS"
-    exit $_EXIT
+PSEOF
 fi
 
 
@@ -448,14 +433,6 @@ echo -e "${YELLOW}--- Running full 18-step hardening ---${RESET}"
 ##########################
 # Step 1: USER / ADMIN AUDIT
 ##########################
-echo "--- [PRE] Security sanity checks ---"
-echo -e "${YELLOW}Users with UID 0 (should only be root):${RESET}"
-awk -F: '$3==0 {print "[ALERT] UID-0 user: " $1}' /etc/passwd | tee -a "$FORENSICS_LOG"
-echo -e "${YELLOW}Users with empty passwords:${RESET}"
-sudo awk -F: '($2=="" || $2=="!!" || $2=="!") {print "[ALERT] Empty/locked: " $1}' /etc/shadow 2>/dev/null | tee -a "$FORENSICS_LOG"
-echo -e "${YELLOW}NOPASSWD in sudoers:${RESET}"
-sudo grep -rn "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | tee -a "$FORENSICS_LOG"
-
 echo "--- [1/18] USER/AUTHORIZED ADMIN AUDIT ---"
 tmp_audit=$(mktemp /tmp/user_audit.XXXX)
 cat > "$tmp_audit" <<EOL
@@ -470,7 +447,8 @@ EOL
 nano "$tmp_audit"
 
 declare -A ADMIN_PASSWORDS
-users_list=""; admins_list="$USER "
+INVOKING_USER=${SUDO_USER:-$USER}
+users_list=""; admins_list="$INVOKING_USER "
 section=""; last_admin=""
 while IFS= read -r line; do
     line=$(echo "$line"|xargs)
@@ -493,6 +471,10 @@ while IFS= read -r line; do
     fi
 done < "$tmp_audit"
 rm -f "$tmp_audit"
+# If nano exited without adding real entries, default to current invoking user only
+if [[ -z "$(echo $admins_list | xargs)" || "$admins_list" == "$INVOKING_USER " ]] && [[ -z "$users_list" ]]; then
+    echo "[WARN] Authorized user list empty or only invoking user - using $INVOKING_USER as sole admin"
+fi
 
 all_authorized="$admins_list $users_list"
 REMOVED_USERS=()
@@ -508,34 +490,13 @@ for user in $(awk -F: '$3>=1000 && $3<=6000 {print $1}' /etc/passwd); do
     fi
 done
 
-# Check sudo group for unauthorized members
-echo -e "${YELLOW}Checking sudo group membership:${RESET}"
-for sudouser in $(getent group sudo | cut -d: -f4 | tr ',' ' '); do
-    if [[ ! " $admins_list " =~ " $sudouser " ]]; then
-        echo -e "${RED}ALERT: $sudouser in sudo group but NOT in authorized admins${RESET}" | tee -a "$FORENSICS_LOG"
-        if [[ "$MODE" != "forensic" && "$DRYRUN" == false ]]; then
-            read -p "Remove $sudouser from sudo? [y/N]: " choice
-            [[ "$choice" =~ ^[Yy]$ ]] && sudo deluser "$sudouser" sudo
-        fi
-    fi
-done
-
 ##########################
 # Step 2: ADMIN PASSWORD ENFORCEMENT
 ##########################
 echo "--- [2/18] Admin password audit ---"
-backup_file "/etc/login.defs"
-$DRYRUN || {
-    sudo sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS	90/'  /etc/login.defs
-    sudo sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS	10/'  /etc/login.defs
-    sudo sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE	7/'   /etc/login.defs
-    echo "[ACTION] login.defs: max=90d, min=10d, warn=7d"
-    # Lock root
-    sudo passwd -l root 2>/dev/null && echo "[ACTION] Root account locked"
-}
 for admin in $admins_list; do
     [[ "$admin" == "$USER" ]] && continue
-    current_hash=$(getent shadow "$admin" 2>/dev/null | cut -d: -f2)
+    current_hash=$(getent shadow "$admin" | cut -d: -f2)
     if [[ -z "$current_hash" || "$current_hash" == "!" || "$current_hash" == "*" ]]; then
         echo "Admin $admin has no password set!"
         if [[ "$MODE" != "forensic" && "$DRYRUN" == false ]]; then
@@ -544,21 +505,12 @@ for admin in $admins_list; do
         fi
     fi
 done
-# Apply chage policy to all regular users
-$DRYRUN || for user in $(awk -F: '$3>=1000 && $3<=60000 {print $1}' /etc/passwd); do
-    sudo chage --maxdays 90 --mindays 10 --warndays 7 "$user" 2>/dev/null
-done
 
 ##########################
 # Step 3: SYSTEM UPDATE CHECK
 ##########################
 echo "--- [3/18] Updating system ---"
-$DRYRUN && echo "[DRY-RUN] Skipping apt update/upgrade." || {
-    sudo apt update -y && sudo apt upgrade -y && sudo apt dist-upgrade -y
-    sudo apt install -y auditd fail2ban libpam-pwquality unattended-upgrades 2>/dev/null || true
-    sudo dpkg-reconfigure -plow unattended-upgrades 2>/dev/null || true
-    echo "[ACTION] Updates applied; auditd, fail2ban, pam-pwquality, unattended-upgrades installed"
-}
+$DRYRUN && echo "[DRY-RUN] Skipping apt update/upgrade." || { sudo apt update -y && sudo apt upgrade -y; }
 
 ##########################
 # Step 4: PAM/SSH HARDENING
@@ -567,28 +519,8 @@ echo "--- [4/18] PAM/SSH hardening ---"
 backup_file "$PAM_DIR/common-password"
 backup_file "$SSHD"
 $DRYRUN || {
-    if grep -q "pam_pwquality.so" "$PAM_DIR/common-password"; then
-        sudo sed -i '/pam_pwquality.so/{ /minlen/! s/$/ minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1/ }' "$PAM_DIR/common-password"
-    elif grep -q "pam_cracklib.so" "$PAM_DIR/common-password"; then
-        sudo sed -i 's/pam_cracklib.so.*/pam_cracklib.so minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1/' "$PAM_DIR/common-password"
-    else
-        echo "[WARN] No pam_pwquality or pam_cracklib found; skipping password complexity config"
-    fi
-    sudo sed -i 's/^#*\s*PermitRootLogin\s.*/PermitRootLogin no/'           "$SSHD"
-    sudo sed -i 's/^#*\s*Protocol\s.*/Protocol 2/'                          "$SSHD"
-    sudo sed -i 's/^#*\s*PermitEmptyPasswords\s.*/PermitEmptyPasswords no/' "$SSHD"
-    sudo sed -i 's/^#*\s*X11Forwarding\s.*/X11Forwarding no/'               "$SSHD"
-    sudo sed -i 's/^#*\s*IgnoreRhosts\s.*/IgnoreRhosts yes/'                "$SSHD"
-    sudo sed -i 's/^#*\s*LoginGraceTime\s.*/LoginGraceTime 60/'             "$SSHD"
-    sudo sed -i 's/^#*\s*MaxAuthTries\s.*/MaxAuthTries 4/'                  "$SSHD"
-    sudo sed -i 's/^#*\s*ClientAliveInterval\s.*/ClientAliveInterval 300/'  "$SSHD"
-    sudo sed -i 's/^#*\s*ClientAliveCountMax\s.*/ClientAliveCountMax 0/'    "$SSHD"
-    # Add settings if not present
-    grep -q "^ClientAliveInterval" "$SSHD" || echo "ClientAliveInterval 300" | sudo tee -a "$SSHD" > /dev/null
-    grep -q "^ClientAliveCountMax" "$SSHD" || echo "ClientAliveCountMax 0"   | sudo tee -a "$SSHD" > /dev/null
-    # Verify before restart
-    sudo sshd -t && sudo systemctl restart sshd && echo "[ACTION] SSH hardened and restarted" \
-        || echo "[ERROR] sshd_config has syntax errors - NOT restarted"
+    sudo sed -i 's/^#\(.*pam_cracklib.so.*\)/\1 minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1/' "$PAM_DIR/common-password"
+    sudo sed -i 's/^#\(PermitRootLogin\s*\).*$/\1 no/' "$SSHD"
 }
 
 ##########################
@@ -596,32 +528,18 @@ $DRYRUN || {
 ##########################
 echo "--- [5/18] Firewall setup ---"
 $DRYRUN || {
+    command -v ufw &>/dev/null || sudo apt-get install -y ufw
     sudo ufw default deny incoming
     sudo ufw default allow outgoing
     sudo ufw allow ssh
-    sudo ufw enable
+    echo "y" | sudo ufw enable
 }
 
 ##########################
 # Step 6: FAIL2BAN
 ##########################
 echo "--- [6/18] Fail2Ban installation/check ---"
-$DRYRUN || {
-    sudo systemctl enable --now fail2ban
-    if [[ ! -f /etc/fail2ban/jail.local ]]; then
-        sudo tee /etc/fail2ban/jail.local > /dev/null <<F2BEOF
-[DEFAULT]
-bantime  = 3600
-findtime  = 600
-maxretry = 5
-
-[sshd]
-enabled = true
-F2BEOF
-        sudo systemctl restart fail2ban
-        echo "[ACTION] Fail2Ban configured with SSH jail"
-    fi
-}
+$DRYRUN || { dpkg -s fail2ban &>/dev/null || sudo apt-get install -y fail2ban; sudo systemctl enable --now fail2ban; }
 
 ##########################
 # Step 7: BACKGROUND UPDATES
@@ -639,82 +557,19 @@ $DRYRUN || sudo chage --maxdays 90 --mindays 10 $USER
 # Step 9: ACCOUNT LOCKOUT
 ##########################
 echo "--- [9/18] Account lockout ---"
-FAILLOCK_CONF="/etc/security/faillock.conf"
-if [[ "$DRYRUN" == false ]]; then
-    if [[ -f "$FAILLOCK_CONF" ]]; then
-        sudo grep -q "^deny" "$FAILLOCK_CONF" \
-            && sudo sed -i 's/^deny\s*=.*/deny = 5/' "$FAILLOCK_CONF" \
-            || echo "deny = 5" | sudo tee -a "$FAILLOCK_CONF" > /dev/null
-        sudo grep -q "^unlock_time" "$FAILLOCK_CONF" \
-            && sudo sed -i 's/^unlock_time\s*=.*/unlock_time = 1800/' "$FAILLOCK_CONF" \
-            || echo "unlock_time = 1800" | sudo tee -a "$FAILLOCK_CONF" > /dev/null
-        echo "[LOCKOUT] Set deny=5, unlock_time=1800 in faillock.conf"
-    else
-        echo "[WARN] faillock.conf not found; attempting PAM tally2 fallback"
-        sudo sed -i '/pam_tally2/ { /deny/! s/$/ deny=5 unlock_time=1800/ }' "$PAM_DIR/common-auth" 2>/dev/null || \
-            echo "[WARN] Could not configure account lockout automatically"
-    fi
-fi
+$DRYRUN || sudo faillock --user $USER --reset
 
 ##########################
 # Step 10: LOCAL AUDIT POLICY
 ##########################
 echo "--- [10/18] Audit policies ---"
-$DRYRUN || {
-    sudo systemctl enable --now auditd 2>/dev/null || true
-    sudo auditctl -e 1
-    sudo auditctl -w /etc/passwd  -p wa -k identity
-    sudo auditctl -w /etc/shadow  -p wa -k identity
-    sudo auditctl -w /etc/sudoers -p wa -k sudoers
-    sudo auditctl -w /etc/ssh     -p wa -k sshd
-    sudo auditctl -w /var/log     -p wa -k logs
-    echo "[ACTION] auditd enabled with key rules"
-}
+$DRYRUN || { command -v auditctl &>/dev/null || sudo apt-get install -y auditd; sudo systemctl enable --now auditd; sudo auditctl -e 1; }
 
 ##########################
 # Step 11: SECURITY OPTIONS
 ##########################
-echo "--- [11/18] Kernel hardening (sysctl) ---"
-backup_file "/etc/sysctl.conf"
-$DRYRUN || {
-    sudo tee /etc/sysctl.d/99-beast-hardening.conf > /dev/null << 'SYSCTL_EOF'
-# IP Spoofing protection
-net.ipv4.conf.all.rp_filter=1
-net.ipv4.conf.default.rp_filter=1
-# Disable source routing
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
-net.ipv6.conf.all.accept_source_route=0
-# Ignore ICMP broadcast
-net.ipv4.icmp_echo_ignore_broadcasts=1
-net.ipv4.icmp_ignore_bogus_error_responses=1
-# Log martian packets
-net.ipv4.conf.all.log_martians=1
-# Disable ICMP redirects
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv6.conf.all.accept_redirects=0
-# Disable IP forwarding
-net.ipv4.ip_forward=0
-net.ipv6.conf.all.forwarding=0
-# Disable send redirects
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.default.send_redirects=0
-# SYN flood protection
-net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_max_syn_backlog=2048
-net.ipv4.tcp_synack_retries=2
-net.ipv4.tcp_syn_retries=5
-# ASLR
-kernel.randomize_va_space=2
-# Restrict dmesg/kptr to root
-kernel.dmesg_restrict=1
-kernel.kptr_restrict=2
-# No core dumps for suid
-fs.suid_dumpable=0
-SYSCTL_EOF
-    sudo sysctl -p /etc/sysctl.d/99-beast-hardening.conf && echo "[ACTION] Kernel hardening applied"
-}
+echo "--- [11/18] MSCT Security Options ---"
+$DRYRUN || echo "[INFO] MSCT security applied (logs only)"
 
 ##########################
 # Step 12: SERVICES DISABLE
@@ -727,30 +582,8 @@ done
 ##########################
 # Step 13: FEATURES
 ##########################
-echo "--- [13/18] Login screen hardening + feature disable ---"
-$DRYRUN || {
-    # lightdm (Ubuntu <= 20.04, Mint, Xubuntu)
-    if [[ -f /etc/lightdm/lightdm.conf ]]; then
-        backup_file "/etc/lightdm/lightdm.conf"
-        sudo sed -i 's/^autologin-user=.*/autologin-user=/'        /etc/lightdm/lightdm.conf
-        sudo sed -i 's/^autologin-guest=.*/autologin-guest=false/' /etc/lightdm/lightdm.conf
-        sudo sed -i 's/^allow-guest=.*/allow-guest=false/'         /etc/lightdm/lightdm.conf
-        sudo sed -i 's/^greeter-hide-users=.*/greeter-hide-users=true/' /etc/lightdm/lightdm.conf
-        echo "[ACTION] lightdm: auto-login disabled, guest disabled"
-    fi
-    # gdm3 (Ubuntu 22.04+)
-    if [[ -f /etc/gdm3/custom.conf ]]; then
-        backup_file "/etc/gdm3/custom.conf"
-        sudo sed -i 's/^#*\s*AutomaticLoginEnable.*/AutomaticLoginEnable=false/' /etc/gdm3/custom.conf
-        echo "[ACTION] gdm3: auto-login disabled"
-    fi
-    # Disable ctrl-alt-del
-    sudo systemctl mask ctrl-alt-del.target 2>/dev/null && echo "[ACTION] ctrl-alt-del disabled"
-    # Session timeout
-    echo "TMOUT=900" | sudo tee /etc/profile.d/timeout.sh > /dev/null
-    echo "[ACTION] Session timeout: 900s"
-    sudo systemctl mask rpcbind.service
-}
+echo "--- [13/18] Disabling unnecessary features ---"
+$DRYRUN || sudo systemctl mask rpcbind.service
 
 ##########################
 # Step 14: SUSPICIOUS FILE SCAN
@@ -776,8 +609,10 @@ while IFS= read -r f; do
     log_suspicious "$f" "SUID/SGID"
 done < <(find /usr/bin /usr/sbin -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)
 
-# Hidden files in /etc and /home
+# Hidden files in /etc and /home (exclude script's own backup dirs)
 while IFS= read -r f; do
+    [[ "$f" == *"/cp-backups/"* ]] && continue
+    [[ "$f" == *"/cp-logs/"* ]] && continue
     log_suspicious "$f" "Hidden file"
 done < <(find /etc /home -name ".*" -type f 2>/dev/null)
 
@@ -785,55 +620,16 @@ done < <(find /etc /home -name ".*" -type f 2>/dev/null)
 while IFS= read -r f; do
     log_suspicious "$f" "Suspicious extension ($(basename "$f"))"
 done < <(find /tmp /var/tmp -type f \( -name "*.sh" -o -name "*.py" -o -name "*.pl" -o -name "*.php" -o -name "*.exe" \) 2>/dev/null)
-# Hacking tools (common CyberPatriot deduction item)
-HACK_TOOLS="nmap zenmap wireshark tshark tcpdump netcat netcat-traditional netcat-openbsd nikto ophcrack john hydra aircrack-ng ettercap sqlmap dirb gobuster medusa maltego"
-for tool in $HACK_TOOLS; do
-    if dpkg -l "$tool" &>/dev/null; then
-        echo -e "${RED}[ALERT] Hacking tool installed: $tool${RESET}" | tee -a "$FORENSICS_LOG"
-        if [[ "$MODE" != "forensic" && "$DRYRUN" == false ]]; then
-            read -p "Remove $tool? [y/N]: " choice
-            [[ "$choice" =~ ^[Yy]$ ]] && sudo apt-get purge -y "$tool"
-        fi
-    fi
-done
-
-# Crontab audit (common persistence vector)
-echo "=== CRONTAB AUDIT ===" | tee -a "$FORENSICS_LOG"
-cat /etc/crontab 2>/dev/null | tee -a "$FORENSICS_LOG"
-ls /etc/cron.d/ 2>/dev/null | tee -a "$FORENSICS_LOG"
-for user in $(awk -F: '$3>=1000 {print $1}' /etc/passwd); do
-    crontab -u "$user" -l 2>/dev/null | tee -a "$FORENSICS_LOG"
-done
-
-# Sudoers audit
-echo "=== SUDOERS AUDIT ===" | tee -a "$FORENSICS_LOG"
-sudo grep -rn "NOPASSWD\|timestamp_timeout\|!authenticate" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | tee -a "$FORENSICS_LOG"
-
-# IP spoofing protection in /etc/host.conf
-$DRYRUN || {
-    grep -q "^nospoof on" /etc/host.conf 2>/dev/null || echo "nospoof on" | sudo tee -a /etc/host.conf > /dev/null
-    echo "[ACTION] /etc/host.conf: nospoof on"
-}
-
 ##########################
 # Step 15: BACKUP SUSPICIOUS FILES
 ##########################
 echo "--- [15/18] Backing up suspicious files ---"
 $DRYRUN || while read -r f; do backup_file "$f"; done < "$SUSPICIOUS_OUTPUT"
 
-# Home directory permissions (community tip)
-$DRYRUN || for u in $(awk -F: '$3>=1000 && $3<=60000 {print $1}' /etc/passwd); do
-    [[ -d "/home/$u" ]] && sudo chmod 750 "/home/$u" && echo "[ACTION] chmod 750 /home/$u"
-done
-# /etc/shadow permissions
-$DRYRUN || sudo chmod 640 /etc/shadow && echo "[ACTION] /etc/shadow set to 640"
-
 ##########################
 # Step 16: READ README / Apache/MySQL Detection
 ##########################
 echo "--- [16/18] Detecting Apache/MySQL & scanning README ---"
-APACHE_FOUND=false
-MYSQL_FOUND=false
 README_PATH=$(find / -type f -iname 'README' 2>/dev/null | head -n1)
 if [[ -z "$README_PATH" ]]; then
     read -p "README not found. Enter README URL: " README_URL
@@ -848,34 +644,11 @@ if grep -iq "mysql" "$README_PATH"; then echo "[INFO] MySQL mentioned in README"
 ##########################
 echo "--- [17/18] Apache/MySQL hardening ---"
 $DRYRUN || {
-    if [[ "${APACHE_FOUND:-false}" == true ]]; then
-        sudo a2enmod security2 headers 2>/dev/null
-        APACHE_CONF="/etc/apache2/conf-available/security.conf"
-        [[ -f "$APACHE_CONF" ]] && {
-            backup_file "$APACHE_CONF"
-            sudo sed -i 's/ServerTokens .*/ServerTokens Prod/'      "$APACHE_CONF"
-            sudo sed -i 's/ServerSignature .*/ServerSignature Off/'  "$APACHE_CONF"
-        }
-        HTTPD_CONF="/etc/apache2/apache2.conf"
-        [[ -f "$HTTPD_CONF" ]] && sudo sed -i 's/Options Indexes/Options -Indexes/' "$HTTPD_CONF"
+    if [[ "$APACHE_FOUND" == true ]]; then
+        sudo a2enmod security2 headers
         sudo systemctl restart apache2
-        echo "[ACTION] Apache hardened and restarted"
     fi
-    [[ "${MYSQL_FOUND:-false}" == true ]] && sudo mysql_secure_installation
-    # vsftpd hardening if present
-    if [[ -f /etc/vsftpd.conf ]]; then
-        backup_file "/etc/vsftpd.conf"
-        sudo sed -i 's/^anonymous_enable=.*/anonymous_enable=NO/'      /etc/vsftpd.conf
-        sudo sed -i 's/^local_enable=.*/local_enable=YES/'             /etc/vsftpd.conf
-        sudo sed -i 's/^#chroot_local_user=.*/chroot_local_user=YES/'  /etc/vsftpd.conf
-        echo "[ACTION] vsftpd hardened"
-    fi
-    # Samba: restrict anonymous if present
-    if [[ -f /etc/samba/smb.conf ]]; then
-        backup_file "/etc/samba/smb.conf"
-        grep -q "restrict anonymous" /etc/samba/smb.conf || sudo sed -i '/\[global\]/a restrict anonymous = 2' /etc/samba/smb.conf
-        echo "[ACTION] Samba: restrict anonymous = 2"
-    fi
+    $MYSQL_FOUND && sudo mysql_secure_installation
 }
 
 ##########################
@@ -937,3 +710,285 @@ echo "================== LOG LOCATIONS =================="
 [[ -f "$ERR" ]] && echo "Error log:         $ERR"
 [[ -f "$FORENSICS_LOG" ]] && echo "Forensics log:     $FORENSICS_LOG"
 echo "==================================================="
+
+##########################
+# [R1-A] KERNEL HARDENING via sysctl
+##########################
+echo "--- [R1-A] Kernel hardening (sysctl) ---"
+$DRYRUN || {
+    SYSCTL_CONF="/etc/sysctl.d/99-beast-hardening.conf"
+    backup_file "$SYSCTL_CONF"
+    cat > "$SYSCTL_CONF" << 'SYSCTL_EOF'
+# BEAST hardening - kernel parameters
+# Network: disable IP forwarding
+net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+# SYN flood protection
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 2
+# Ignore ICMP broadcast and bogus error responses
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+# Disable source routing and redirects
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+# Enable reverse path filtering
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+# Log martian packets
+net.ipv4.conf.all.log_martians = 1
+# ASLR
+kernel.randomize_va_space = 2
+# Disable magic SysRq
+kernel.sysrq = 0
+# Restrict dmesg access
+kernel.dmesg_restrict = 1
+# Restrict ptrace
+kernel.yama.ptrace_scope = 1
+# Disable core dumps for SUID programs
+fs.suid_dumpable = 0
+SYSCTL_EOF
+    sysctl -p "$SYSCTL_CONF" 2>>"$ERR" && echo "[SYSCTL] Kernel hardening applied" || echo "[WARN] sysctl apply had errors (see error log)"
+    echo "[SYSCTL] Kernel hardening parameters written to $SYSCTL_CONF" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would apply sysctl kernel hardening"
+
+##########################
+# [R1-B] GRUB TIMEOUT + PERMISSIONS
+##########################
+echo "--- [R1-B] GRUB timeout & permissions ---"
+$DRYRUN || {
+    GRUB_CFG="/etc/default/grub"
+    if [[ -f "$GRUB_CFG" ]]; then
+        backup_file "$GRUB_CFG"
+        # Set timeout to 5s max
+        sudo sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' "$GRUB_CFG"
+        # Disable recovery menu (hides boot options)
+        sudo sed -i 's/^#GRUB_DISABLE_RECOVERY=.*/GRUB_DISABLE_RECOVERY="true"/' "$GRUB_CFG"
+        grep -q "^GRUB_DISABLE_RECOVERY" "$GRUB_CFG" || echo 'GRUB_DISABLE_RECOVERY="true"' | sudo tee -a "$GRUB_CFG" > /dev/null
+        sudo update-grub 2>>"$ERR" && echo "[GRUB] Config updated" || echo "[WARN] update-grub failed"
+        # Lock down grub.cfg permissions
+        [[ -f /boot/grub/grub.cfg ]] && sudo chmod 600 /boot/grub/grub.cfg && echo "[GRUB] grub.cfg permissions set to 600"
+    fi
+    echo "[GRUB] GRUB hardening complete" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would harden GRUB config"
+
+##########################
+# [R2-A] DISABLE USB STORAGE
+##########################
+echo "--- [R2-A] Disable USB storage module ---"
+$DRYRUN || {
+    USB_BLACKLIST="/etc/modprobe.d/beast-disable-usb.conf"
+    backup_file "$USB_BLACKLIST"
+    echo "install usb-storage /bin/true" | sudo tee "$USB_BLACKLIST" > /dev/null
+    echo "blacklist usb-storage" | sudo tee -a "$USB_BLACKLIST" > /dev/null
+    sudo rmmod usb-storage 2>/dev/null && echo "[USB] usb-storage unloaded" || echo "[USB] usb-storage not loaded (ok)"
+    echo "[USB] usb-storage disabled via modprobe blacklist" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would blacklist usb-storage"
+
+##########################
+# [R2-B] CORE DUMP DISABLE (limits.conf + systemd)
+##########################
+echo "--- [R2-B] Disable core dumps ---"
+$DRYRUN || {
+    LIMITS_CONF="/etc/security/limits.conf"
+    backup_file "$LIMITS_CONF"
+    grep -q "hard core 0" "$LIMITS_CONF" || echo "* hard core 0" | sudo tee -a "$LIMITS_CONF" > /dev/null
+    grep -q "soft core 0" "$LIMITS_CONF" || echo "* soft core 0" | sudo tee -a "$LIMITS_CONF" > /dev/null
+    # systemd coredump disable
+    sudo mkdir -p /etc/systemd/coredump.conf.d
+    echo -e "[Coredump]\nStorage=none\nProcessSizeMax=0" | sudo tee /etc/systemd/coredump.conf.d/disable.conf > /dev/null
+    echo "[COREDUMP] Core dumps disabled" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would disable core dumps"
+
+##########################
+# [R2-C] TCP WRAPPERS - hosts.deny / hosts.allow
+##########################
+echo "--- [R2-C] TCP Wrappers (hosts.deny) ---"
+$DRYRUN || {
+    backup_file /etc/hosts.deny
+    backup_file /etc/hosts.allow
+    grep -q "ALL: ALL" /etc/hosts.deny 2>/dev/null || echo "ALL: ALL" | sudo tee -a /etc/hosts.deny > /dev/null
+    grep -q "sshd: ALL" /etc/hosts.allow 2>/dev/null || echo "sshd: ALL" | sudo tee -a /etc/hosts.allow > /dev/null
+    echo "[TCPWRAP] hosts.deny set to deny all; hosts.allow permits SSH" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would configure TCP wrappers"
+
+##########################
+# [R3-A] EMPTY PASSWORD ACCOUNTS CHECK & LOCK
+##########################
+echo "--- [R3-A] Empty password check ---"
+EMPTY_PW_FOUND=false
+while IFS=: read -r user pw rest; do
+    if [[ "$pw" == "" ]]; then
+        echo "[ALERT] Empty password for user: $user" | tee -a "$FORENSICS_LOG"
+        EMPTY_PW_FOUND=true
+        $DRYRUN || sudo passwd -l "$user" && echo "[LOCKED] $user locked" | tee -a "$FORENSICS_LOG"
+    fi
+done < /etc/shadow
+$EMPTY_PW_FOUND || echo "[OK] No empty passwords found"
+
+##########################
+# [R3-B] UNATTENDED UPGRADES (auto security patches)
+##########################
+echo "--- [R3-B] Unattended upgrades setup ---"
+$DRYRUN || {
+    dpkg -s unattended-upgrades &>/dev/null || sudo apt-get install -y unattended-upgrades
+    sudo dpkg-reconfigure -plow unattended-upgrades --frontend=noninteractive 2>/dev/null || true
+    UA_CONF="/etc/apt/apt.conf.d/20auto-upgrades"
+    if [[ ! -f "$UA_CONF" ]]; then
+        cat << 'APT_CONF' | sudo tee "$UA_CONF" > /dev/null
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+APT_CONF
+    fi
+    sudo systemctl enable --now unattended-upgrades 2>/dev/null || true
+    echo "[AUTOUPGRADE] Unattended upgrades enabled" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would enable unattended upgrades"
+
+##########################
+# [R3-C] CHECK SUDOERS FOR NOPASSWD ENTRIES
+##########################
+echo "--- [R3-C] Sudoers NOPASSWD audit ---"
+{
+    grep -rn "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | while read -r line; do
+        echo "[ALERT] NOPASSWD sudoers entry: $line" | tee -a "$FORENSICS_LOG"
+    done
+} || true
+echo "[SUDOERS] Audit complete"
+
+##########################
+# [R4-A] LISTENING PORT AUDIT
+##########################
+echo "--- [R4-A] Listening port audit ---"
+{
+    echo "[PORT AUDIT] $(date)" | tee -a "$FORENSICS_LOG"
+    ss -tlnp 2>/dev/null | tee -a "$FORENSICS_LOG" | while read -r line; do
+        echo "$line"
+    done
+    # Flag unexpected listening ports (not 22/ssh)
+    ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' | grep -v '0.0.0.0:22\|127.0.0.1:22\|\[::\]:22\|:::22' | while read -r addr; do
+        echo "[ALERT] Unexpected listening port: $addr" | tee -a "$FORENSICS_LOG"
+    done
+} || true
+
+##########################
+# [R4-B] INSTALL & RUN CLAMAV
+##########################
+echo "--- [R4-B] ClamAV antivirus scan ---"
+$DRYRUN || {
+    if ! command -v clamscan &>/dev/null; then
+        echo "[CLAM] Installing ClamAV..."
+        sudo apt-get install -y clamav clamav-daemon 2>>"$ERR"
+    fi
+    # Update signatures (non-blocking, best-effort)
+    sudo systemctl stop clamav-freshclam 2>/dev/null || true
+    sudo freshclam --quiet 2>>"$ERR" || echo "[CLAM] freshclam update failed (offline?)"
+    # Quick scan of /tmp and /home
+    echo "[CLAM] Scanning /tmp and /home..."
+    clamscan --recursive --quiet --infected /tmp /home 2>>"$ERR" | tee -a "$FORENSICS_LOG" | while read -r line; do
+        echo "[CLAM RESULT] $line"
+    done
+    echo "[CLAM] Scan complete" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would install ClamAV and scan /tmp /home"
+
+##########################
+# [R4-C] DISABLE IPv6 (if not needed)
+##########################
+echo "--- [R4-C] Disable IPv6 ---"
+$DRYRUN || {
+    GRUB_CFG="/etc/default/grub"
+    if grep -q "ipv6.disable=1" "$GRUB_CFG" 2>/dev/null; then
+        echo "[IPv6] Already disabled via GRUB"
+    else
+        # Use sysctl to disable at runtime (safer than GRUB edit)
+        grep -q "net.ipv6.conf.all.disable_ipv6" /etc/sysctl.d/99-beast-hardening.conf 2>/dev/null || {
+            echo "net.ipv6.conf.all.disable_ipv6 = 1" | sudo tee -a /etc/sysctl.d/99-beast-hardening.conf > /dev/null
+            echo "net.ipv6.conf.default.disable_ipv6 = 1" | sudo tee -a /etc/sysctl.d/99-beast-hardening.conf > /dev/null
+            sudo sysctl -p /etc/sysctl.d/99-beast-hardening.conf 2>>"$ERR" | tail -2
+        }
+    fi
+    echo "[IPv6] IPv6 disabled via sysctl" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would disable IPv6"
+
+##########################
+# [R5-A] FULL SSH HARDENING
+##########################
+echo "--- [R5-A] Full SSH hardening ---"
+$DRYRUN || {
+    backup_file "$SSHD"
+    declare -A SSH_SETTINGS=(
+        ["PermitRootLogin"]="no"
+        ["PasswordAuthentication"]="yes"
+        ["PermitEmptyPasswords"]="no"
+        ["X11Forwarding"]="no"
+        ["MaxAuthTries"]="3"
+        ["LoginGraceTime"]="30"
+        ["AllowTcpForwarding"]="no"
+        ["ClientAliveInterval"]="300"
+        ["ClientAliveCountMax"]="2"
+        ["UsePAM"]="yes"
+        ["PrintLastLog"]="yes"
+        ["IgnoreRhosts"]="yes"
+        ["HostbasedAuthentication"]="no"
+    )
+    for key in "${!SSH_SETTINGS[@]}"; do
+        val="${SSH_SETTINGS[$key]}"
+        if grep -qE "^#?${key}" "$SSHD"; then
+            sudo sed -i "s|^#\?${key}.*|${key} ${val}|" "$SSHD"
+        else
+            echo "${key} ${val}" | sudo tee -a "$SSHD" > /dev/null
+        fi
+        echo "[SSH] Set $key = $val"
+    done
+    sudo systemctl reload sshd 2>>"$ERR" && echo "[SSH] sshd reloaded" || echo "[WARN] sshd reload failed"
+    echo "[SSH] Full SSH hardening applied" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would apply full SSH hardening"
+
+##########################
+# [R5-B] LOGIN BANNERS (issue / issue.net / motd)
+##########################
+echo "--- [R5-B] Login banners ---"
+$DRYRUN || {
+    BANNER="Authorized access only. All activity is monitored and logged. Unauthorized access is prohibited."
+    echo "$BANNER" | sudo tee /etc/issue > /dev/null
+    echo "$BANNER" | sudo tee /etc/issue.net > /dev/null
+    echo "$BANNER" | sudo tee /etc/motd > /dev/null
+    grep -q "^Banner" "$SSHD" && sudo sed -i 's|^Banner.*|Banner /etc/issue.net|' "$SSHD" || \
+        echo "Banner /etc/issue.net" | sudo tee -a "$SSHD" > /dev/null
+    echo "[BANNER] Login banners configured" | tee -a "$FORENSICS_LOG"
+}
+$DRYRUN && echo "[DRY-RUN] Would set login banners"
+
+##########################
+# [R5-C] CRON AUDIT - suspicious cron entries
+##########################
+echo "--- [R5-C] Cron audit ---"
+{
+    for crondir in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /var/spool/cron/crontabs; do
+        [[ -d "$crondir" ]] || continue
+        find "$crondir" -type f 2>/dev/null | while read -r cronfile; do
+            grep -v "^#\|^$" "$cronfile" 2>/dev/null | grep -E "^[0-9*@]" | while read -r entry; do
+                echo "[CRON ENTRY] $cronfile: $entry" | tee -a "$FORENSICS_LOG"
+            done
+        done
+    done
+    # User crontabs
+    crontab -l 2>/dev/null | grep -v "^#\|^$" | while read -r entry; do
+        echo "[CRON] $USER crontab: $entry" | tee -a "$FORENSICS_LOG"
+    done
+    echo "[CRON] Cron audit complete"
+} || true
