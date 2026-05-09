@@ -57,6 +57,32 @@ function Backup-File([string]$Path){
     }
 }
 
+function Set-Reg([string]$Path, [string]$Name, [object]$Val, [string]$Type="DWord") {
+    if ($DRYRUN) { Write-Normal "[DRY-RUN] Would set $Path :: $Name = $Val"; return }
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    Set-ItemProperty -Path $Path -Name $Name -Value $Val -Type $Type -Force -EA SilentlyContinue
+    Write-Normal "[REG] $Path :: $Name = $Val"
+}
+
+function Write-Alert([string]$Msg) {
+    Write-Host "[ALERT] $Msg" -ForegroundColor Red
+    Write-Forensics "[ALERT] $Msg"
+}
+
+function Write-Warn([string]$Msg) {
+    Write-Host "[WARN] $Msg" -ForegroundColor Yellow
+    Write-Normal "[WARN] $Msg"
+}
+
+# Suspicious files output path (populated in Step 12)
+$SUSP_OUT = "$LOG_DIR\suspicious_$TIMESTAMP.txt"
+
+# OpenSSH sshd_config path (used in SSH hardening steps)
+$sshdConf = $null
+foreach ($p in @("C:\ProgramData\ssh\sshd_config","$env:ProgramData\ssh\sshd_config")) {
+    if (Test-Path $p) { $sshdConf = $p; break }
+}
+
 # -----------------------------
 # Step 1: User/Admin Audit
 # -----------------------------
@@ -354,6 +380,256 @@ FLUSH PRIVILEGES;
         Write-Normal "[MYSQL] Root password secured, anonymous/test DB removed"
     }
 }
+
+
+# ============================================================
+# [R1-A] TCP/IP STACK HARDENING
+# Windows: Tcpip registry params + ASLR MoveImages + WDigest
+# ============================================================
+Write-Host "--- [R1-A] TCP/IP Stack Hardening ---" -ForegroundColor Magenta
+$tcpPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+Set-Reg $tcpPath "IPEnableRouter"          0   # disable IP forwarding
+Set-Reg $tcpPath "SynAttackProtect"        2   # SYN flood protection (tcp_syncookies equiv)
+Set-Reg $tcpPath "TcpMaxPortsExhausted"    5
+Set-Reg $tcpPath "TcpMaxHalfOpen"          100
+Set-Reg $tcpPath "TcpMaxHalfOpenRetried"   80
+Set-Reg $tcpPath "DisableIPSourceRouting"  2   # accept_source_route = 0
+Set-Reg $tcpPath "EnableICMPRedirect"      0   # accept_redirects = 0
+Set-Reg $tcpPath "EnableDeadGWDetect"      0
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" "DisableIPSourceRouting" 2
+# ASLR (randomize_va_space = 2 equiv)
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "MoveImages" 1
+# DEP must not be disabled (suid_dumpable = 0 equiv)
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "NoDataExecutionPrevention" 0
+# Disable WDigest plaintext creds in memory (ptrace_scope equiv)
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" "UseLogonCredential" 0
+Write-Forensics "[R1-A] TCP/IP stack hardening applied"
+
+# ============================================================
+# [R1-B] BOOT HARDENING
+# Windows: bcdedit timeout=5, recoveryenabled=No, nx=OptIn
+# ============================================================
+Write-Host "--- [R1-B] Boot Hardening ---" -ForegroundColor Magenta
+if (-not $DRYRUN) {
+    $r1 = bcdedit /timeout 5 2>&1
+    $r2 = bcdedit /set "{default}" recoveryenabled No 2>&1
+    $r3 = bcdedit /set "{default}" nx OptIn 2>&1
+    Write-Normal "[BOOT] bcdedit timeout: $r1"
+    Write-Normal "[BOOT] bcdedit recovery: $r2"
+    Write-Normal "[BOOT] bcdedit nx: $r3"
+}
+Write-Forensics "[R1-B] Boot hardening applied"
+
+# ============================================================
+# [R2-A] DISABLE USB STORAGE
+# Windows: USBSTOR Start=4 (driver disabled)
+# ============================================================
+Write-Host "--- [R2-A] Disable USB Storage ---" -ForegroundColor Magenta
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR" "Start" 4
+Write-Normal "[USB] USBSTOR Start=4 (driver disabled)"
+Write-Forensics "[R2-A] USB storage disabled"
+
+# ============================================================
+# [R2-B] DISABLE CRASH DUMPS
+# Windows: CrashDumpEnabled=0, WER disabled
+# ============================================================
+Write-Host "--- [R2-B] Disable Crash Dumps ---" -ForegroundColor Magenta
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" "Disabled" 1
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"      "CrashDumpEnabled" 0
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"      "AutoReboot" 1
+$werSvc = Get-Service -Name "WerSvc" -EA SilentlyContinue
+if ($werSvc -and -not $DRYRUN) {
+    Stop-Service "WerSvc" -Force -EA SilentlyContinue
+    Set-Service  "WerSvc" -StartupType Disabled -EA SilentlyContinue
+    Write-Normal "[COREDUMP] WerSvc disabled"
+}
+Write-Forensics "[R2-B] Crash dumps disabled"
+
+# ============================================================
+# [R2-C] FIREWALL ALLOW-LIST (TCP Wrappers equivalent)
+# Windows: log Public inbound ALLOW rules; ensure SSH explicitly allowed
+# ============================================================
+Write-Host "--- [R2-C] Firewall Allow-List Review ---" -ForegroundColor Magenta
+Get-NetFirewallRule -Direction Inbound -Action Allow -EA SilentlyContinue |
+    Where-Object { $_.Profile -match "Public" -and $_.DisplayName -notlike "BEAST*" } |
+    ForEach-Object { Write-Forensics "[FW RULE] Public inbound ALLOW: $($_.DisplayName)" }
+if (-not $DRYRUN) {
+    Remove-NetFirewallRule -DisplayName "BEAST-Allow-SSH" -EA SilentlyContinue
+    New-NetFirewallRule -DisplayName "BEAST-Allow-SSH" -Direction Inbound `
+        -Protocol TCP -LocalPort 22 -Action Allow -Profile Any -EA SilentlyContinue | Out-Null
+    Write-Normal "[TCPWRAP] SSH explicitly allowed; all other Public inbound logged"
+}
+Write-Forensics "[R2-C] Firewall allow-list reviewed"
+
+# ============================================================
+# [R3-A] EMPTY PASSWORD CHECK
+# Windows: Get-LocalUser PasswordRequired=$false + disable
+# ============================================================
+Write-Host "--- [R3-A] Empty Password Check ---" -ForegroundColor Magenta
+$emptyFound = $false
+Get-LocalUser | Where-Object { $_.Enabled -and (-not $_.PasswordRequired) } | ForEach-Object {
+    Write-Alert "No password required for account: $($_.Name)"
+    $emptyFound = $true
+    if (-not $DRYRUN) {
+        $_ | Set-LocalUser -PasswordNeverExpires $false -UserMayChangePassword $true -EA SilentlyContinue
+        if ($allAuthorized -notcontains $_.Name) {
+            Disable-LocalUser -Name $_.Name -EA SilentlyContinue
+            Write-Normal "[LOCKED] Disabled no-password account: $($_.Name)"
+        }
+    }
+}
+if (-not $emptyFound) { Write-Normal "[OK] No accounts with missing password requirement" }
+
+# ============================================================
+# [R3-B] AUTO SECURITY UPDATES
+# Windows: WindowsUpdate policy registry
+# ============================================================
+Write-Host "--- [R3-B] Automatic Security Updates ---" -ForegroundColor Magenta
+$wuPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+Set-Reg $wuPol "DisableWindowsUpdateAccess" 0
+Set-Reg ($wuPol + "\AU") "NoAutoUpdate"    0
+Set-Reg ($wuPol + "\AU") "AUOptions"       4
+Write-Forensics "[R3-B] Auto security updates enforced"
+
+# ============================================================
+# [R3-C] ADMIN GROUP / NOPASSWD AUDIT
+# Windows: list Administrators group + PasswordNeverExpires accounts
+# ============================================================
+Write-Host "--- [R3-C] Admin Group Audit ---" -ForegroundColor Magenta
+try {
+    (Get-LocalGroupMember -Group "Administrators" -EA Stop) | ForEach-Object {
+        Write-Alert "Admin group member: $($_.Name)  Type=$($_.ObjectClass)"
+        Write-Forensics "[ADMIN MEMBER] $($_.Name)  Type=$($_.ObjectClass)"
+    }
+} catch { Write-Warn "Could not enumerate Administrators group" }
+Get-LocalUser | Where-Object { $_.PasswordNeverExpires -and $_.Enabled } | ForEach-Object {
+    Write-Alert "PasswordNeverExpires account: $($_.Name)"
+    Write-Forensics "[NOEXPIRY] $($_.Name)  PasswordNeverExpires=True"
+}
+
+# ============================================================
+# [R4-A] LISTENING PORT AUDIT
+# Windows: Get-NetTCPConnection -State Listen
+# ============================================================
+Write-Host "--- [R4-A] Listening Port Audit ---" -ForegroundColor Magenta
+$expectedPorts = @(22, 3389)
+Get-NetTCPConnection -State Listen -EA SilentlyContinue | ForEach-Object {
+    $port = $_.LocalPort
+    $proc = (Get-Process -Id $_.OwningProcess -EA SilentlyContinue).Name
+    Write-Forensics "[PORT] $($_.LocalAddress):$port  PID=$($_.OwningProcess)  Process=$proc"
+    if ($expectedPorts -notcontains $port) {
+        Write-Alert "Unexpected listening port: $($_.LocalAddress):$port ($proc)"
+    }
+}
+Write-Normal "[PORTS] Port audit complete"
+
+# ============================================================
+# [R4-B] ANTIVIRUS SCAN
+# Windows: Windows Defender Update-MpSignature + Start-MpScan
+# ============================================================
+Write-Host "--- [R4-B] Antivirus Scan (Defender) ---" -ForegroundColor Magenta
+if (-not $DRYRUN) {
+    $mp = Get-MpComputerStatus -EA SilentlyContinue
+    if ($mp) {
+        Write-Forensics "[DEFENDER] RealTime=$($mp.RealTimeProtectionEnabled)  AVEnabled=$($mp.AntivirusEnabled)"
+        Set-MpPreference -DisableRealtimeMonitoring $false -EA SilentlyContinue
+        Write-Normal "[DEFENDER] Updating signatures..."
+        Update-MpSignature -EA SilentlyContinue
+        Start-MpScan -ScanType QuickScan -EA SilentlyContinue
+        foreach ($sp in @("C:\Users","C:\Temp","C:\Windows\Temp","C:\ProgramData")) {
+            if (Test-Path $sp) { Start-MpScan -ScanType CustomScan -ScanPath $sp -EA SilentlyContinue }
+        }
+        Get-MpThreat -EA SilentlyContinue | ForEach-Object {
+            Write-Alert "DEFENDER THREAT: $($_.ThreatName)  Resources=$($_.Resources)"
+        }
+        Write-Normal "[DEFENDER] Scan complete"
+    } else { Write-Warn "Windows Defender not available" }
+}
+Write-Forensics "[R4-B] AV scan complete"
+
+# ============================================================
+# [R4-C] DISABLE IPv6
+# Windows: DisabledComponents=0xFF + Disable-NetAdapterBinding ms_tcpip6
+# ============================================================
+Write-Host "--- [R4-C] Disable IPv6 ---" -ForegroundColor Magenta
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" "DisabledComponents" 0xFF
+if (-not $DRYRUN) {
+    Get-NetAdapter -EA SilentlyContinue | ForEach-Object {
+        $b = Get-NetAdapterBinding -Name $_.Name -ComponentID "ms_tcpip6" -EA SilentlyContinue
+        if ($b -and $b.Enabled) {
+            Disable-NetAdapterBinding -Name $_.Name -ComponentID "ms_tcpip6" -EA SilentlyContinue
+            Write-Normal "[IPv6] Disabled on: $($_.Name)"
+        }
+    }
+}
+Write-Forensics "[R4-C] IPv6 disabled"
+
+# ============================================================
+# [R5-A] FULL SSH HARDENING
+# Windows: OpenSSH sshd_config full pass + login banner
+# ============================================================
+Write-Host "--- [R5-A] Full SSH Hardening ---" -ForegroundColor Magenta
+if ($sshdConf -and -not $DRYRUN) {
+    $content = Get-Content $sshdConf
+    $sshdSettings = @{
+        "PermitRootLogin"         = "no"
+        "PermitEmptyPasswords"    = "no"
+        "MaxAuthTries"            = "3"
+        "LoginGraceTime"          = "30"
+        "AllowTcpForwarding"      = "no"
+        "X11Forwarding"           = "no"
+        "ClientAliveInterval"     = "300"
+        "ClientAliveCountMax"     = "2"
+        "IgnoreRhosts"            = "yes"
+        "HostbasedAuthentication" = "no"
+        "PrintLastLog"            = "yes"
+    }
+    foreach ($key in $sshdSettings.Keys) {
+        $val = $sshdSettings[$key]
+        if ($content -match "^#?\s*$key\s") {
+            $content = $content -replace "^#?\s*$key.*", "$key $val"
+        } else { $content += "$key $val" }
+    }
+    $bannerFile = "C:\ProgramData\ssh\beast_banner.txt"
+    "Authorized access only. All activity is monitored and logged." | Set-Content $bannerFile -EA SilentlyContinue
+    if ($content -match "^#?\s*Banner\s") {
+        $content = $content -replace "^#?\s*Banner.*", "Banner $bannerFile"
+    } else { $content += "Banner $bannerFile" }
+    $content | Set-Content $sshdConf
+    Restart-Service sshd -EA SilentlyContinue
+    Write-Normal "[SSH] sshd_config hardened and banner added"
+} elseif (-not $sshdConf) { Write-Warn "[SSH] sshd_config not found - OpenSSH may not be installed" }
+Write-Forensics "[R5-A] Full SSH hardening complete"
+
+# ============================================================
+# [R5-B] LOGIN BANNER
+# Windows: LegalNoticeCaption + LegalNoticeText registry
+# ============================================================
+Write-Host "--- [R5-B] Login Banner ---" -ForegroundColor Magenta
+$banner = "Authorized access only. All activity is monitored and logged. Unauthorized access is prohibited."
+$polPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+Set-Reg $polPath "LegalNoticeCaption" "AUTHORIZED ACCESS ONLY" "String"
+Set-Reg $polPath "LegalNoticeText"    $banner                   "String"
+Write-Forensics "[R5-B] Login banner set"
+
+# ============================================================
+# [R5-C] SCHEDULED TASKS AUDIT (Cron equivalent)
+# Windows: Get-ScheduledTask full inventory + flag interpreter tasks
+# ============================================================
+Write-Host "--- [R5-C] Scheduled Tasks Audit ---" -ForegroundColor Magenta
+Write-Forensics "[SCHED AUDIT] $(Get-Date)"
+Get-ScheduledTask | ForEach-Object {
+    $t = $_
+    $acts = ($t.Actions | ForEach-Object { ($_.Execute + " " + $_.Arguments).Trim() }) -join " ; "
+    $trigs = ($t.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ","
+    $line = "[SCHED] $($t.TaskPath)$($t.TaskName)  State=$($t.State)  Triggers=$trigs  Actions=$acts"
+    Write-Forensics $line
+    if ($acts -match "powershell|wscript|cscript|cmd\.exe|mshta|regsvr32" -and
+        $t.TaskPath -notlike "\Microsoft\*") {
+        Write-Alert "Non-MS scheduled task runs interpreter: $($t.TaskName) -> $acts"
+    }
+}
+Write-Normal "[R5-C] Scheduled task audit complete"
 
 Write-Host "[INFO] 18-step hardening & forensics complete"
 Write-Forensics "[INFO] Script completed"
