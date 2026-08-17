@@ -22,6 +22,10 @@ param(
     [switch]$UNDO
 )
 
+# Master gate: true only in explicit normal (change) mode, never during a dry run.
+# Forensic mode and dry-run mode must NEVER modify target files/system state.
+$MAKE_CHANGES = ($NORMAL -and -not $DRYRUN)
+
 # -----------------------------
 # Global Paths
 # -----------------------------
@@ -58,7 +62,7 @@ function Backup-File([string]$Path){
 }
 
 function Set-Reg([string]$Path, [string]$Name, [object]$Val, [string]$Type="DWord") {
-    if ($DRYRUN) { Write-Normal "[DRY-RUN] Would set $Path :: $Name = $Val"; return }
+    if (-not $MAKE_CHANGES) { Write-Normal "[DRY-RUN/FORENSIC] Would set $Path :: $Name = $Val"; return }
     if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
     Set-ItemProperty -Path $Path -Name $Name -Value $Val -Type $Type -Force -EA SilentlyContinue
     Write-Normal "[REG] $Path :: $Name = $Val"
@@ -87,6 +91,14 @@ foreach ($p in @("C:\ProgramData\ssh\sshd_config","$env:ProgramData\ssh\sshd_con
 # Step 1: User/Admin Audit
 # -----------------------------
 Write-Host "=== Step 1/18: User/Admin Audit ==="
+if ($FORENSIC) {
+    Write-Host "[INFO] Forensic mode: user/admin audit skipped (no prompts, no comparisons)"
+    Write-Forensics "[INFO] User/Admin audit skipped in forensic mode"
+    $admins_list = @()
+    $users_list = @()
+    $admin_passwords = @{}
+    $allAuthorized = @()
+} else {
 $tmpFile = "$env:TEMP\authorized_users.txt"
 @"
 # Authorized Administrators:
@@ -137,7 +149,7 @@ foreach ($u in $foundUsers){
     Write-Forensics "[USER AUDIT] User: $($u.Name), Enabled: $($u.Enabled), Admin: $($u.IsAdministrator)"
     if (-not ($allAuthorized -contains $u.Name)){
         Write-Forensics "[ALERT] Unauthorized user found: $($u.Name)"
-        if (-not $FORENSIC -and -not $DRYRUN){
+        if (-not $DRYRUN){
             $choice = Read-Host "Remove user $($u.Name)? [y/N]"
             if ($choice -match "^[Yy]$") {
                 Remove-LocalUser -Name $u.Name
@@ -146,6 +158,7 @@ foreach ($u in $foundUsers){
         }
     }
 }
+} # end else ($FORENSIC)
 
 # -----------------------------
 # Step 2: Admin Password Enforcement
@@ -277,18 +290,79 @@ if ($NORMAL -and -not $DRYRUN){
 Write-Forensics "Event logs & scheduled tasks checked"
 
 # -----------------------------
+# ------------------------------
 # Step 12: Suspicious File Scan
-# -----------------------------
+# ------------------------------
 Write-Host "=== Step 12/18: Suspicious File Scan ==="
-$SuspiciousFiles = Get-ChildItem -Path 'C:\Users','C:\ProgramData' -Recurse -Force -ErrorAction SilentlyContinue |
-    Where-Object { $_.Extension -match '.ps1|.bat|.exe|.pl|.py' -or $_.Attributes -match 'Hidden' }
+
+# Polyglot / masquerading detection: check first line for shebang mismatch
+function Test-Polyglot {
+    param([string]$FilePath)
+    try {
+        $firstLine = (Get-Content -Path $FilePath -TotalCount 1 -ErrorAction Stop)
+        if ($firstLine -match '^#!') {
+            $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
+            $shebang = $firstLine.ToLower()
+            # Map extensions to expected shebangs
+            $extToShebang = @{
+                '.pl' = 'perl'
+                '.py' = 'python'
+                '.sh' = 'bash|sh'
+                '.rb' = 'ruby'
+                '.php' = 'php'
+            }
+            if ($extToShebang.ContainsKey($ext)) {
+                $expected = $extToShebang[$ext]
+                if ($shebang -notmatch $expected) {
+                    return "POLYGLOT: extension $ext but shebang says: $firstLine"
+                }
+            }
+            # Also flag any shebang in non-script extensions
+            $scriptExts = @('.pl','.py','.sh','.rb','.php','.ps1','.bat')
+            if ($ext -notin $scriptExts -and $shebang -match 'bash|sh|perl|python|ruby|php|cmd|powershell') {
+                return "POLYGLOT: non-script extension but shebang present: $firstLine"
+            }
+        }
+    } catch { }
+    return $null
+}
+
+$SuspiciousFiles = Get-ChildItem -Path 'C:\Users','C:\ProgramData' -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {
+    # Only files, not directories
+    -not $_.PSIsContainer -and (
+        # Script extensions
+        $_.Extension -match '\.ps1|\.bat|\.exe|\.pl|\.py|\.sh|\.rb|\.php' -or
+        # Hidden files that are ALSO executable or have script shebang
+        ($_.Attributes -match 'Hidden' -and (
+            $_.Extension -match '\.exe|\.dll|\.ps1|\.bat|\.cmd|\.vbs|\.js|\.wsf' -or
+            (Test-Polyglot $_.FullName)
+        ))
+    )
+}
+
 foreach ($f in $SuspiciousFiles){
     $reasons=@()
-    if ($f.Attributes -match 'Hidden'){ $reasons+='Hidden file' }
-    if ($f.Extension -match '.ps1|.bat|.exe|.pl|.py'){ $reasons+="Suspicious extension ($($f.Extension))" }
-    $reasonStr = ($reasons -join '; ')
-    Write-Forensics "[SUSPICIOUS] $($f.FullName) - $reasonStr"
+
+    # Check for polyglot/masquerading
+    $polyglotReason = Test-Polyglot $f.FullName
+    if ($polyglotReason) { $reasons += $polyglotReason }
+
+    # Extension-based flags
+    if ($f.Extension -match '\.ps1|\.bat|\.exe|\.pl|\.py|\.sh|\.rb|\.php'){ 
+        $reasons += "Suspicious extension ($($f.Extension))" 
+    }
+
+    # Hidden + executable (not just hidden alone)
+    if ($f.Attributes -match 'Hidden' -and $f.Extension -match '\.exe|\.dll|\.ps1|\.bat|\.cmd'){ 
+        $reasons += "Hidden executable" 
+    }
+
+    if ($reasons.Count -gt 0) {
+        $reasonStr = ($reasons -join '; ')
+        Write-Forensics "[SUSPICIOUS] $($f.FullName) - $reasonStr"
+    }
 }
+
 
 # -----------------------------
 # Step 13: Backup User Files
@@ -346,7 +420,7 @@ Write-Host "=== Step 18/18: Apache/MySQL Hardening ==="
 $apacheSvc = Get-Service | Where-Object {$_.Name -match "Apache"}
 if ($apacheSvc){
     Write-Forensics "Detected Apache service"
-    if (-not $DRYRUN){
+    if ($MAKE_CHANGES){
         $httpdConf = "C:\Apache24\conf\httpd.conf"
         if (Test-Path $httpdConf){
             Copy-Item $httpdConf "$httpdConf.bak" -Force
@@ -363,7 +437,7 @@ if ($apacheSvc){
 $mysqlSvc = Get-Service | Where-Object {$_.Name -match "MySQL|mysqld"}
 if ($mysqlSvc){
     Write-Forensics "Detected MySQL service"
-    if (-not $DRYRUN){
+    if ($MAKE_CHANGES){
         $mysqlRootPass = Read-Host "Enter strong MySQL root password" -AsSecureString
         $plainPass = [System.Net.NetworkCredential]::new("", $mysqlRootPass).Password
         $sqlCmds = @"
@@ -410,7 +484,7 @@ Write-Forensics "[R1-A] TCP/IP stack hardening applied"
 # Windows: bcdedit timeout=5, recoveryenabled=No, nx=OptIn
 # ============================================================
 Write-Host "--- [R1-B] Boot Hardening ---" -ForegroundColor Magenta
-if (-not $DRYRUN) {
+if ($MAKE_CHANGES) {
     $r1 = bcdedit /timeout 5 2>&1
     $r2 = bcdedit /set "{default}" recoveryenabled No 2>&1
     $r3 = bcdedit /set "{default}" nx OptIn 2>&1
@@ -438,7 +512,7 @@ Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" "Disabled" 1
 Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"      "CrashDumpEnabled" 0
 Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"      "AutoReboot" 1
 $werSvc = Get-Service -Name "WerSvc" -EA SilentlyContinue
-if ($werSvc -and -not $DRYRUN) {
+if ($werSvc -and $MAKE_CHANGES) {
     Stop-Service "WerSvc" -Force -EA SilentlyContinue
     Set-Service  "WerSvc" -StartupType Disabled -EA SilentlyContinue
     Write-Normal "[COREDUMP] WerSvc disabled"
@@ -453,7 +527,7 @@ Write-Host "--- [R2-C] Firewall Allow-List Review ---" -ForegroundColor Magenta
 Get-NetFirewallRule -Direction Inbound -Action Allow -EA SilentlyContinue |
     Where-Object { $_.Profile -match "Public" -and $_.DisplayName -notlike "BEAST*" } |
     ForEach-Object { Write-Forensics "[FW RULE] Public inbound ALLOW: $($_.DisplayName)" }
-if (-not $DRYRUN) {
+if ($MAKE_CHANGES) {
     Remove-NetFirewallRule -DisplayName "BEAST-Allow-SSH" -EA SilentlyContinue
     New-NetFirewallRule -DisplayName "BEAST-Allow-SSH" -Direction Inbound `
         -Protocol TCP -LocalPort 22 -Action Allow -Profile Any -EA SilentlyContinue | Out-Null
@@ -470,7 +544,7 @@ $emptyFound = $false
 Get-LocalUser | Where-Object { $_.Enabled -and (-not $_.PasswordRequired) } | ForEach-Object {
     Write-Alert "No password required for account: $($_.Name)"
     $emptyFound = $true
-    if (-not $DRYRUN) {
+    if ($MAKE_CHANGES) {
         $_ | Set-LocalUser -PasswordNeverExpires $false -UserMayChangePassword $true -EA SilentlyContinue
         if ($allAuthorized -notcontains $_.Name) {
             Disable-LocalUser -Name $_.Name -EA SilentlyContinue
@@ -528,7 +602,7 @@ Write-Normal "[PORTS] Port audit complete"
 # Windows: Windows Defender Update-MpSignature + Start-MpScan
 # ============================================================
 Write-Host "--- [R4-B] Antivirus Scan (Defender) ---" -ForegroundColor Magenta
-if (-not $DRYRUN) {
+if ($MAKE_CHANGES) {
     $mp = Get-MpComputerStatus -EA SilentlyContinue
     if ($mp) {
         Write-Forensics "[DEFENDER] RealTime=$($mp.RealTimeProtectionEnabled)  AVEnabled=$($mp.AntivirusEnabled)"
@@ -553,7 +627,7 @@ Write-Forensics "[R4-B] AV scan complete"
 # ============================================================
 Write-Host "--- [R4-C] Disable IPv6 ---" -ForegroundColor Magenta
 Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" "DisabledComponents" 0xFF
-if (-not $DRYRUN) {
+if ($MAKE_CHANGES) {
     Get-NetAdapter -EA SilentlyContinue | ForEach-Object {
         $b = Get-NetAdapterBinding -Name $_.Name -ComponentID "ms_tcpip6" -EA SilentlyContinue
         if ($b -and $b.Enabled) {
@@ -569,7 +643,7 @@ Write-Forensics "[R4-C] IPv6 disabled"
 # Windows: OpenSSH sshd_config full pass + login banner
 # ============================================================
 Write-Host "--- [R5-A] Full SSH Hardening ---" -ForegroundColor Magenta
-if ($sshdConf -and -not $DRYRUN) {
+if ($sshdConf -and $MAKE_CHANGES) {
     $content = Get-Content $sshdConf
     $sshdSettings = @{
         "PermitRootLogin"         = "no"
@@ -654,7 +728,7 @@ ERR="$LOG_DIR/errors_$TIMESTAMP.log"
 FORENSICS_LOG="$LOG_DIR/forensics_$TIMESTAMP.log"
 SUSPICIOUS_OUTPUT="$LOG_DIR/suspicious_files_$TIMESTAMP.txt"
 
-exec > >(tee -i "$LOG") 2> >(tee -a "$ERR" >&2)
+#exec > >(tee -i "$LOG") 2> >(tee -a "$ERR" >&2)
 
 RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; RESET="\e[0m"
 
@@ -667,6 +741,11 @@ for arg in "$@"; do
     [[ "$arg" == "--undo" ]] && UNDO=true
 done
 
+# Master gate: skip any action that changes files/system state whenever
+# running in forensic mode or dry-run mode.
+SKIP_CHANGES=false
+[[ "$DRYRUN" == true || "$MODE" == "forensic" ]] && SKIP_CHANGES=true
+
 # --------------------
 # Undo Functionality
 # --------------------
@@ -674,12 +753,12 @@ BACKED_UP_FILES=()
 REMOVED_USERS=()
 STOPPED_SERVICES=()
 backup_file() {
-    [[ -f "$1" ]] && cp -n "$1" "$BACKUP_DIR/$(basename $1).bak" && BACKED_UP_FILES+=("$1")
+    [[ -f "$1" ]] && cp -n "$1" "$BACKUP_DIR/$(basename "$1").bak" && BACKED_UP_FILES+=("$1")
 }
 undo_script() {
     echo -e "${YELLOW}UNDO MODE: Restoring backups and undoing changes...${RESET}"
     for file in "${BACKED_UP_FILES[@]}"; do
-        [[ -f "$BACKUP_DIR/$(basename $file).bak" ]] && sudo cp "$BACKUP_DIR/$(basename $file).bak" "$file"
+        [[ -f "$BACKUP_DIR/$(basename "$file").bak" ]] && sudo cp "$BACKUP_DIR/$(basename "$file").bak" "$file"
     done
     for user in "${REMOVED_USERS[@]}"; do
         sudo adduser --disabled-password --gecos "" "$user"
@@ -710,6 +789,14 @@ echo -e "${YELLOW}--- Running full 18-step hardening ---${RESET}"
 # Step 1: USER / ADMIN AUDIT
 ##########################
 echo "--- [1/18] USER/AUTHORIZED ADMIN AUDIT ---"
+INVOKING_USER=${SUDO_USER:-$USER}
+if [[ "$MODE" == "forensic" ]]; then
+    echo "[INFO] Forensic mode: user/admin audit skipped (no prompts, no comparisons)"
+    declare -A ADMIN_PASSWORDS
+    admins_list="$INVOKING_USER "
+    users_list=""
+    all_authorized="$admins_list"
+else
 tmp_audit=$(mktemp /tmp/user_audit.XXXX)
 cat > "$tmp_audit" <<EOL
 # Authorized Administrators:
@@ -723,7 +810,6 @@ EOL
 nano "$tmp_audit"
 
 declare -A ADMIN_PASSWORDS
-INVOKING_USER=${SUDO_USER:-$USER}
 users_list=""; admins_list="$INVOKING_USER "
 section=""; last_admin=""
 while IFS= read -r line; do
@@ -759,12 +845,13 @@ for user in $(awk -F: '$3>=1000 && $3<=6000 {print $1}' /etc/passwd); do
     if [[ ! " $all_authorized " =~ " $user " ]]; then
         echo "ALERT: Unauthorized user detected: $user"
         REMOVED_USERS+=("$user")
-        if [[ "$MODE" != "forensic" && "$DRYRUN" == false ]]; then
+        if [[ "$DRYRUN" == false ]]; then
             read -p "Do you want to remove $user? [y/N]: " choice
             [[ "$choice" =~ ^[Yy]$ ]] && sudo deluser --remove-home "$user"
         fi
     fi
 done
+fi
 
 ##########################
 # Step 2: ADMIN PASSWORD ENFORCEMENT
@@ -786,15 +873,15 @@ done
 # Step 3: SYSTEM UPDATE CHECK
 ##########################
 echo "--- [3/18] Updating system ---"
-$DRYRUN && echo "[DRY-RUN] Skipping apt update/upgrade." || { sudo apt update -y && sudo apt upgrade -y; }
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Skipping apt update/upgrade." || { sudo apt update -y && sudo apt upgrade -y; }
 
 ##########################
 # Step 4: PAM/SSH HARDENING
 ##########################
 echo "--- [4/18] PAM/SSH hardening ---"
-backup_file "$PAM_DIR/common-password"
-backup_file "$SSHD"
-$DRYRUN || {
+$SKIP_CHANGES || {
+    backup_file "$PAM_DIR/common-password"
+    backup_file "$SSHD"
     sudo sed -i 's/^#\(.*pam_cracklib.so.*\)/\1 minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1/' "$PAM_DIR/common-password"
     sudo sed -i 's/^#\(PermitRootLogin\s*\).*$/\1 no/' "$SSHD"
 }
@@ -803,7 +890,7 @@ $DRYRUN || {
 # Step 5: FIREWALL CONFIG
 ##########################
 echo "--- [5/18] Firewall setup ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     command -v ufw &>/dev/null || sudo apt-get install -y ufw
     sudo ufw default deny incoming
     sudo ufw default allow outgoing
@@ -815,31 +902,31 @@ $DRYRUN || {
 # Step 6: FAIL2BAN
 ##########################
 echo "--- [6/18] Fail2Ban installation/check ---"
-$DRYRUN || { dpkg -s fail2ban &>/dev/null || sudo apt-get install -y fail2ban; sudo systemctl enable --now fail2ban; }
+$SKIP_CHANGES || { dpkg -s fail2ban &>/dev/null || sudo apt-get install -y fail2ban; sudo systemctl enable --now fail2ban; }
 
 ##########################
 # Step 7: BACKGROUND UPDATES
 ##########################
 echo "--- [7/18] System updates ---"
-$DRYRUN || sudo apt upgrade -y
+$SKIP_CHANGES || sudo apt upgrade -y
 
 ##########################
 # Step 8: ACCOUNT POLICIES
 ##########################
 echo "--- [8/18] Password policies ---"
-$DRYRUN || sudo chage --maxdays 90 --mindays 10 $USER
+$SKIP_CHANGES || sudo chage --maxdays 90 --mindays 10 $USER
 
 ##########################
 # Step 9: ACCOUNT LOCKOUT
 ##########################
 echo "--- [9/18] Account lockout ---"
-$DRYRUN || sudo faillock --user $USER --reset
+$SKIP_CHANGES || sudo faillock --user $USER --reset
 
 ##########################
 # Step 10: LOCAL AUDIT POLICY
 ##########################
 echo "--- [10/18] Audit policies ---"
-$DRYRUN || { command -v auditctl &>/dev/null || sudo apt-get install -y auditd; sudo systemctl enable --now auditd; sudo auditctl -e 1; }
+$SKIP_CHANGES || { command -v auditctl &>/dev/null || sudo apt-get install -y auditd; sudo systemctl enable --now auditd; sudo auditctl -e 1; }
 
 ##########################
 # Step 11: SECURITY OPTIONS
@@ -852,14 +939,14 @@ $DRYRUN || echo "[INFO] MSCT security applied (logs only)"
 ##########################
 echo "--- [12/18] Disabling unsafe services ---"
 for svc in rpcbind cups avahi-daemon; do
-    $DRYRUN || { sudo systemctl stop "$svc"; sudo systemctl disable "$svc"; STOPPED_SERVICES+=("$svc"); }
+    $SKIP_CHANGES || { sudo systemctl stop "$svc"; sudo systemctl disable "$svc"; STOPPED_SERVICES+=("$svc"); }
 done
 
 ##########################
 # Step 13: FEATURES
 ##########################
 echo "--- [13/18] Disabling unnecessary features ---"
-$DRYRUN || sudo systemctl mask rpcbind.service
+$SKIP_CHANGES || sudo systemctl mask rpcbind.service
 
 ##########################
 # Step 14: SUSPICIOUS FILE SCAN
@@ -872,7 +959,39 @@ log_suspicious() {
     local file="$1"
     local reason="$2"
     echo "[SUSPICIOUS] $file - Reason: $reason" | tee -a "$FORENSICS_LOG"
-    echo "$file" >> "$SUSPICIOUS_OUTPUT"
+    echo "$file|$reason" >> "$SUSPICIOUS_OUTPUT"
+}
+
+# Check if file is a polyglot (extension doesn't match shebang)
+check_polyglot() {
+    local file="$1"
+    [[ ! -f "$file" ]] && return
+    local magic
+    IFS= read -r -n2 magic < "$file" 2>/dev/null
+    [[ "$magic" != "#!" ]] && return
+    local firstline
+    IFS= read -r firstline < "$file" 2>/dev/null
+    [[ ! "$firstline" =~ ^#! ]] && return
+
+    local base="${file##*/}"
+    local ext=""
+    [[ "$base" == *.* ]] && ext="${base##*.}"
+    local lowerline="${firstline,,}"
+
+    case "$ext" in
+        pl)  [[ "$lowerline" =~ perl ]] || echo "POLYGLOT: .pl file but shebang is: $firstline" ;;
+        py)  [[ "$lowerline" =~ python ]] || echo "POLYGLOT: .py file but shebang is: $firstline" ;;
+        sh)  [[ "$lowerline" =~ bash|sh ]] || echo "POLYGLOT: .sh file but shebang is: $firstline" ;;
+        rb)  [[ "$lowerline" =~ ruby ]] || echo "POLYGLOT: .rb file but shebang is: $firstline" ;;
+        php) [[ "$lowerline" =~ php ]] || echo "POLYGLOT: .php file but shebang is: $firstline" ;;
+        "")  # No extension at all is normal for Unix scripts/binaries - not suspicious by itself
+            ;;
+        *)   # Non-script extension with a script shebang = polyglot
+            if [[ "$lowerline" =~ bash|sh|perl|python|ruby|php ]]; then
+                echo "POLYGLOT: non-script extension (.$ext) but shebang is: $firstline"
+            fi
+            ;;
+    esac
 }
 
 # World-writable files
@@ -885,22 +1004,79 @@ while IFS= read -r f; do
     log_suspicious "$f" "SUID/SGID"
 done < <(find /usr/bin /usr/sbin -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)
 
-# Hidden files in /etc and /home (exclude script's own backup dirs)
+# Hidden files: ONLY flag if they are ALSO executable/scripts/polyglots
+# Skip common config dotfiles and script's own dirs
 while IFS= read -r f; do
     [[ "$f" == *"/cp-backups/"* ]] && continue
     [[ "$f" == *"/cp-logs/"* ]] && continue
-    log_suspicious "$f" "Hidden file"
+
+    # Skip common harmless hidden config files
+    basename=$(basename "$f")
+    case "$basename" in
+        .bashrc|.bash_profile|.bash_logout|.profile|.vimrc|.inputrc|\
+        .gitconfig|.gitignore|.ssh_config|.selected_editor|\
+        .Xauthority|.ICEauthority|.pki|.local|.config|.cache|\
+        .myconfig|.mysql_history|.python_history|.lesshst|\
+        .wgetrc|.curlrc|.npmrc|.yarnrc|.gemrc)
+            continue ;;
+    esac
+
+    # Only flag hidden files if they have suspicious properties
+    reasons=""
+
+    # Check if executable
+    if [[ -x "$f" ]]; then
+        reasons="Hidden executable file"
+    fi
+
+    # Check if it's a script by extension
+    if [[ "$f" =~ \.(sh|py|pl|rb|php|exe|bin|elf)$ ]]; then
+        [[ -n "$reasons" ]] && reasons="$reasons; "
+        reasons="${reasons}Hidden script/executable (.$ext)"
+    fi
+
+    # Check for polyglot
+    polyglot_reason=$(check_polyglot "$f")
+    if [[ -n "$polyglot_reason" ]]; then
+        [[ -n "$reasons" ]] && reasons="$reasons; "
+        reasons="${reasons}$polyglot_reason"
+    fi
+
+    # Only log if we found an actual reason beyond just "hidden"
+    if [[ -n "$reasons" ]]; then
+        log_suspicious "$f" "$reasons"
+    fi
 done < <(find /etc /home -name ".*" -type f 2>/dev/null)
 
-# Scripts or executables in /tmp and /var/tmp
+# Scripts or executables in /tmp and /var/tmp (including polyglots)
 while IFS= read -r f; do
-    log_suspicious "$f" "Suspicious extension ($(basename "$f"))"
-done < <(find /tmp /var/tmp -type f \( -name "*.sh" -o -name "*.py" -o -name "*.pl" -o -name "*.php" -o -name "*.exe" \) 2>/dev/null)
+    reasons="Suspicious extension ($(basename "$f"))"
+    polyglot_reason=$(check_polyglot "$f")
+    if [[ -n "$polyglot_reason" ]]; then
+        reasons="$reasons; $polyglot_reason"
+    fi
+    log_suspicious "$f" "$reasons"
+done < <(find /tmp /var/tmp -type f \( -name "*.sh" -o -name "*.py" -o -name "*.pl" -o -name "*.php" -o -name "*.exe" -o -name "*.rb" -o -name "*.bin" \) 2>/dev/null)
+
+# Also scan for polyglots in ALL files (not just known extensions)
+# This catches test.pl with #!/bin/bash anywhere on the system
+while IFS= read -r f; do
+    [[ "$f" == *"/cp-backups/"* ]] && continue
+    [[ "$f" == *"/cp-logs/"* ]] && continue
+    polyglot_reason=$(check_polyglot "$f")
+    if [[ -n "$polyglot_reason" ]]; then
+        # Avoid duplicates
+        if ! grep -qF "$f|" "$SUSPICIOUS_OUTPUT" 2>/dev/null; then
+            log_suspicious "$f" "$polyglot_reason"
+        fi
+    fi
+done < <(find / /tmp /dev/shm -xdev -type f -size -100k     -not -path "/var/lib/dpkg/*"     -not -path "/var/lib/rpm/*"     -not -path "/usr/share/exploitdb/*"     -not -path "/usr/share/metasploit-framework/*"     2>/dev/null)
+
 ##########################
 # Step 15: BACKUP SUSPICIOUS FILES
 ##########################
 echo "--- [15/18] Backing up suspicious files ---"
-$DRYRUN || while read -r f; do backup_file "$f"; done < "$SUSPICIOUS_OUTPUT"
+$DRYRUN || while IFS='|' read -r f _; do backup_file "$f"; done < <(sort -u -t'|' -k1,1 "$SUSPICIOUS_OUTPUT")
 
 ##########################
 # Step 16: READ README / Apache/MySQL Detection
@@ -919,7 +1095,7 @@ if grep -iq "mysql" "$README_PATH"; then echo "[INFO] MySQL mentioned in README"
 # Step 17: SERVICE-SPECIFIC HARDENING
 ##########################
 echo "--- [17/18] Apache/MySQL hardening ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     if [[ "$APACHE_FOUND" == true ]]; then
         sudo a2enmod security2 headers
         sudo systemctl restart apache2
@@ -991,7 +1167,7 @@ echo "==================================================="
 # [R1-A] KERNEL HARDENING via sysctl
 ##########################
 echo "--- [R1-A] Kernel hardening (sysctl) ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     SYSCTL_CONF="/etc/sysctl.d/99-beast-hardening.conf"
     backup_file "$SYSCTL_CONF"
     cat > "$SYSCTL_CONF" << 'SYSCTL_EOF'
@@ -1032,13 +1208,13 @@ SYSCTL_EOF
     sysctl -p "$SYSCTL_CONF" 2>>"$ERR" && echo "[SYSCTL] Kernel hardening applied" || echo "[WARN] sysctl apply had errors (see error log)"
     echo "[SYSCTL] Kernel hardening parameters written to $SYSCTL_CONF" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would apply sysctl kernel hardening"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would apply sysctl kernel hardening"
 
 ##########################
 # [R1-B] GRUB TIMEOUT + PERMISSIONS
 ##########################
 echo "--- [R1-B] GRUB timeout & permissions ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     GRUB_CFG="/etc/default/grub"
     if [[ -f "$GRUB_CFG" ]]; then
         backup_file "$GRUB_CFG"
@@ -1053,13 +1229,13 @@ $DRYRUN || {
     fi
     echo "[GRUB] GRUB hardening complete" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would harden GRUB config"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would harden GRUB config"
 
 ##########################
 # [R2-A] DISABLE USB STORAGE
 ##########################
 echo "--- [R2-A] Disable USB storage module ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     USB_BLACKLIST="/etc/modprobe.d/beast-disable-usb.conf"
     backup_file "$USB_BLACKLIST"
     echo "install usb-storage /bin/true" | sudo tee "$USB_BLACKLIST" > /dev/null
@@ -1067,13 +1243,13 @@ $DRYRUN || {
     sudo rmmod usb-storage 2>/dev/null && echo "[USB] usb-storage unloaded" || echo "[USB] usb-storage not loaded (ok)"
     echo "[USB] usb-storage disabled via modprobe blacklist" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would blacklist usb-storage"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would blacklist usb-storage"
 
 ##########################
 # [R2-B] CORE DUMP DISABLE (limits.conf + systemd)
 ##########################
 echo "--- [R2-B] Disable core dumps ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     LIMITS_CONF="/etc/security/limits.conf"
     backup_file "$LIMITS_CONF"
     grep -q "hard core 0" "$LIMITS_CONF" || echo "* hard core 0" | sudo tee -a "$LIMITS_CONF" > /dev/null
@@ -1083,20 +1259,20 @@ $DRYRUN || {
     echo -e "[Coredump]\nStorage=none\nProcessSizeMax=0" | sudo tee /etc/systemd/coredump.conf.d/disable.conf > /dev/null
     echo "[COREDUMP] Core dumps disabled" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would disable core dumps"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would disable core dumps"
 
 ##########################
 # [R2-C] TCP WRAPPERS - hosts.deny / hosts.allow
 ##########################
 echo "--- [R2-C] TCP Wrappers (hosts.deny) ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     backup_file /etc/hosts.deny
     backup_file /etc/hosts.allow
     grep -q "ALL: ALL" /etc/hosts.deny 2>/dev/null || echo "ALL: ALL" | sudo tee -a /etc/hosts.deny > /dev/null
     grep -q "sshd: ALL" /etc/hosts.allow 2>/dev/null || echo "sshd: ALL" | sudo tee -a /etc/hosts.allow > /dev/null
     echo "[TCPWRAP] hosts.deny set to deny all; hosts.allow permits SSH" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would configure TCP wrappers"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would configure TCP wrappers"
 
 ##########################
 # [R3-A] EMPTY PASSWORD ACCOUNTS CHECK & LOCK
@@ -1107,7 +1283,7 @@ while IFS=: read -r user pw rest; do
     if [[ "$pw" == "" ]]; then
         echo "[ALERT] Empty password for user: $user" | tee -a "$FORENSICS_LOG"
         EMPTY_PW_FOUND=true
-        $DRYRUN || sudo passwd -l "$user" && echo "[LOCKED] $user locked" | tee -a "$FORENSICS_LOG"
+        $SKIP_CHANGES || sudo passwd -l "$user" && echo "[LOCKED] $user locked" | tee -a "$FORENSICS_LOG"
     fi
 done < /etc/shadow
 $EMPTY_PW_FOUND || echo "[OK] No empty passwords found"
@@ -1116,7 +1292,7 @@ $EMPTY_PW_FOUND || echo "[OK] No empty passwords found"
 # [R3-B] UNATTENDED UPGRADES (auto security patches)
 ##########################
 echo "--- [R3-B] Unattended upgrades setup ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     dpkg -s unattended-upgrades &>/dev/null || sudo apt-get install -y unattended-upgrades
     sudo dpkg-reconfigure -plow unattended-upgrades --frontend=noninteractive 2>/dev/null || true
     UA_CONF="/etc/apt/apt.conf.d/20auto-upgrades"
@@ -1130,7 +1306,7 @@ APT_CONF
     sudo systemctl enable --now unattended-upgrades 2>/dev/null || true
     echo "[AUTOUPGRADE] Unattended upgrades enabled" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would enable unattended upgrades"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would enable unattended upgrades"
 
 ##########################
 # [R3-C] CHECK SUDOERS FOR NOPASSWD ENTRIES
@@ -1162,7 +1338,7 @@ echo "--- [R4-A] Listening port audit ---"
 # [R4-B] INSTALL & RUN CLAMAV
 ##########################
 echo "--- [R4-B] ClamAV antivirus scan ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     if ! command -v clamscan &>/dev/null; then
         echo "[CLAM] Installing ClamAV..."
         sudo apt-get install -y clamav clamav-daemon 2>>"$ERR"
@@ -1177,13 +1353,13 @@ $DRYRUN || {
     done
     echo "[CLAM] Scan complete" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would install ClamAV and scan /tmp /home"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would install ClamAV and scan /tmp /home"
 
 ##########################
 # [R4-C] DISABLE IPv6 (if not needed)
 ##########################
 echo "--- [R4-C] Disable IPv6 ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     GRUB_CFG="/etc/default/grub"
     if grep -q "ipv6.disable=1" "$GRUB_CFG" 2>/dev/null; then
         echo "[IPv6] Already disabled via GRUB"
@@ -1197,13 +1373,13 @@ $DRYRUN || {
     fi
     echo "[IPv6] IPv6 disabled via sysctl" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would disable IPv6"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would disable IPv6"
 
 ##########################
 # [R5-A] FULL SSH HARDENING
 ##########################
 echo "--- [R5-A] Full SSH hardening ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     backup_file "$SSHD"
     declare -A SSH_SETTINGS=(
         ["PermitRootLogin"]="no"
@@ -1234,13 +1410,13 @@ systemctl list-units --type=service 2>/dev/null | grep -q "sshd.service" && SSH_
 sudo systemctl reload $SSH_SVC 2>>"$ERR" && echo "[SSH] $SSH_SVC reloaded" || echo "[WARN] $SSH_SVC reload failed"
     echo "[SSH] Full SSH hardening applied" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would apply full SSH hardening"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would apply full SSH hardening"
 
 ##########################
 # [R5-B] LOGIN BANNERS (issue / issue.net / motd)
 ##########################
 echo "--- [R5-B] Login banners ---"
-$DRYRUN || {
+$SKIP_CHANGES || {
     BANNER="Authorized access only. All activity is monitored and logged. Unauthorized access is prohibited."
     echo "$BANNER" | sudo tee /etc/issue > /dev/null
     echo "$BANNER" | sudo tee /etc/issue.net > /dev/null
@@ -1249,7 +1425,7 @@ $DRYRUN || {
         echo "Banner /etc/issue.net" | sudo tee -a "$SSHD" > /dev/null
     echo "[BANNER] Login banners configured" | tee -a "$FORENSICS_LOG"
 }
-$DRYRUN && echo "[DRY-RUN] Would set login banners"
+$SKIP_CHANGES && echo "[DRY-RUN/FORENSIC] Would set login banners"
 
 ##########################
 # [R5-C] CRON AUDIT - suspicious cron entries
@@ -1270,3 +1446,83 @@ echo "--- [R5-C] Cron audit ---"
     done
     echo "[CRON] Cron audit complete"
 } || true
+
+##########################
+# Step 19: AI LOG ANALYSIS (Qwen2.5-Coder-1.5B via Ollama)
+##########################
+echo "--- [19/19] AI analysis of session logs (Qwen2.5-Coder-1.5B) ---"
+AI_LOG_DIR="$LOG_DIR/AI-cp-logs"
+mkdir -p "$AI_LOG_DIR"
+AI_LOG="$AI_LOG_DIR/ai_analysis_$TIMESTAMP.log"
+AI_MODEL="qwen2.5-coder:1.5b-instruct"
+
+ai_log_analysis() {
+    if ! command -v ollama >/dev/null 2>&1; then
+        echo "[AI] ollama not installed, skipping AI analysis" | tee -a "$FORENSICS_LOG"
+        return
+    fi
+
+    if ! curl -s -m 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+        nohup ollama serve >/tmp/ollama-serve.log 2>&1 &
+        disown
+        sleep 3
+    fi
+
+    if ! curl -s -m 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+        echo "[AI] ollama service unreachable, skipping AI analysis" | tee -a "$FORENSICS_LOG"
+        return
+    fi
+
+    if ! ollama list 2>/dev/null | grep -q "$AI_MODEL"; then
+        echo "[AI] Model $AI_MODEL not pulled, skipping AI analysis (run: ollama pull $AI_MODEL)" | tee -a "$FORENSICS_LOG"
+        return
+    fi
+
+    local combined
+    combined=$(
+        {
+            echo "=== FORENSICS LOG ==="
+            [[ -f "$FORENSICS_LOG" ]] && tail -c 6000 "$FORENSICS_LOG"
+            echo
+            echo "=== SUSPICIOUS FILES ==="
+            [[ -f "$SUSPICIOUS_OUTPUT" ]] && tail -c 3000 "$SUSPICIOUS_OUTPUT"
+            echo
+            echo "=== HARDENING LOG ==="
+            [[ -f "$LOG" ]] && tail -c 3000 "$LOG"
+            echo
+            echo "=== ERROR LOG ==="
+            [[ -f "$ERR" ]] && tail -c 1500 "$ERR"
+        }
+    )
+
+    local prompt="You are a security analyst reviewing CyberPatriot hardening script output. Summarize key findings, flag anything suspicious or high-risk (backdoors, malicious cron, unauthorized sudoers, unexpected listening ports, suspicious files), and give a short prioritized action list. Be concise.
+
+LOGS:
+$combined"
+
+    echo "[AI] Sending logs to $AI_MODEL for analysis..." | tee -a "$FORENSICS_LOG"
+
+    local response
+    response=$(jq -n --arg model "$AI_MODEL" --arg prompt "$prompt" \
+        '{model: $model, prompt: $prompt, stream: false}' | \
+        timeout 180 curl -s -X POST http://127.0.0.1:11434/api/generate -d @-)
+
+    local analysis
+    analysis=$(echo "$response" | jq -r '.response // empty' 2>/dev/null)
+
+    if [[ -z "$analysis" ]]; then
+        echo "[AI] No response from model, skipping" | tee -a "$FORENSICS_LOG"
+        return
+    fi
+
+    {
+        echo "AI Log Analysis - $TIMESTAMP"
+        echo "Model: $AI_MODEL"
+        echo "======================================"
+        echo "$analysis"
+    } > "$AI_LOG"
+
+    echo "[AI] Analysis written to $AI_LOG" | tee -a "$FORENSICS_LOG"
+}
+
+ai_log_analysis
